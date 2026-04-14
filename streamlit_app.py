@@ -1,4 +1,4 @@
-<FILE filename="streamlit_app (20).py" size="50123 bytes">
+
 """
 Decathlon Product Lookup
 Improvements (applied per user request):
@@ -1263,4 +1263,3 @@ else:
 
 st.markdown("---")
 st.caption("Decathlon Product Lookup · Powered by your Decathlon working file")
-</FILE>
