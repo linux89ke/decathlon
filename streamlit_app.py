@@ -60,7 +60,7 @@ MASTER_TO_TEMPLATE = {
     "product_name":   "Name",
     "designed_for":   "Description",
     "sku_num_sku_r3": "SellerSKU",
-    "model_code":     "ParentSKU",
+    # ParentSKU is derived dynamically (first SKU per model_code), not mapped directly
     "brand_name":     "Brand",
     "bar_code":       "GTIN_Barcode",
     "color":          "color",
@@ -493,6 +493,14 @@ def build_template(
     data_font  = Font(name=hfont.name or "Calibri", size=hfont.size or 11)
     data_align = Alignment(vertical="center")
 
+    # ── Build model_code -> first SKU mapping (ParentSKU) ─────────────────
+    model_to_first_sku: dict = {}
+    for _, r in results_df.iterrows():
+        mc  = str(r.get("model_code", "")).strip()
+        sku = str(r.get("sku_num_sku_r3", "")).strip()
+        if mc and sku and mc not in model_to_first_sku:
+            model_to_first_sku[mc] = sku
+
     for i, (_, src_row) in enumerate(results_df.iterrows()):
         row_idx  = i + 2
         row_data = {}
@@ -502,6 +510,11 @@ def build_template(
             val = src_row.get(master_col, "")
             if pd.notna(val) and str(val).strip() not in ("", "nan"):
                 row_data[tmpl_col] = str(val).strip()
+
+        # ── ParentSKU: first SKU encountered for this model_code ─────────
+        mc = str(src_row.get("model_code", "")).strip()
+        if mc and mc in model_to_first_sku:
+            row_data["ParentSKU"] = model_to_first_sku[mc]
 
         # ── GTIN: convert scientific notation to full integer string ───────
         gtin = _format_gtin(src_row.get("bar_code", ""))
