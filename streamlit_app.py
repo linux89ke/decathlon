@@ -1,16 +1,23 @@
 """
 Decathlon Product Lookup
 Improvements:
- - Variation mapping: includes actual size/color values from master file
+ - Variation mapping: Fashion uses size col + UK extraction + sizes.txt validation; Other uses variation col
+ - Product type toggle: Fashion vs Other (controls size vs variation column)
+ - sizes.txt dropdown: validate/select sizes for fashion products
+ - Price: always 100000
+ - Color family: duplicate of color
+ - Missing variation: shows '...' for Other products
+ - Category: full Category Path written to template
  - Short description: rule-based bullets OR Groq AI
  - AI category matching deduped by model_code (saves Groq API calls)
  - Product name in export: appends color if not already present
- - product_weight: strips"kg"from business_weight
+ - product_weight: strips "kg" from business_weight
  - package_content: Name - Size
  - GTIN/barcode: converted from scientific notation to full integer string
 """
 
 import os, io, re, json, asyncio
+from typing import Optional
 import numpy as np
 import streamlit as st
 import pandas as pd
@@ -74,6 +81,48 @@ MASTER_TO_TEMPLATE = {
   "picture_6":   "Image7",
   "picture_7":   "Image8",
 }
+
+SIZES_PATH = "sizes.txt"
+
+# =============================================================================
+# UK SIZE EXTRACTION
+# =============================================================================
+
+# Patterns to extract UK sizes from messy size strings
+_UK_SIZE_PATTERNS = [
+  # "UK 10", "UK10", "UK29""
+  re.compile(r'\bUK\s*(\d{1,2}(?:\.\d)?)\b', re.IGNORECASE),
+  # "UK 4-6", "UK 6-8 / EU S"
+  re.compile(r'\bUK\s*(\d{1,2}(?:\.\d)?)\s*[-–]\s*\d{1,2}', re.IGNORECASE),
+]
+
+_CHILDREN_AGE_PATTERN = re.compile(
+  r'(\d{1,2})\s*-\s*(\d{1,2})\s*(?:years?|yrs?)',
+  re.IGNORECASE,
+)
+
+def extract_uk_size(raw: str) -> Optional[str]:
+  """Try to extract a clean UK size label from a messy size string.
+  Returns the first UK size found, or None if no UK size detected."""
+  if not raw:
+    return None
+  cleaned = re.sub(r'"+', '', raw).strip()
+  for pat in _UK_SIZE_PATTERNS:
+    m = pat.search(cleaned)
+    if m:
+      return f"UK {m.group(1)}"
+  return None
+
+
+def parse_valid_sizes(path: str) -> list:
+  """Load sizes.txt — one size per line, skip blanks/comments."""
+  try:
+    with open(path, "r", encoding="utf-8") as f:
+      lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    return lines
+  except FileNotFoundError:
+    return []
+
 
 CATEGORY_MATCH_FIELDS = [
   "family","type","department_label","nature_label",
@@ -244,62 +293,160 @@ def keyword_match_category(row: pd.Series, df_cat: pd.DataFrame) -> tuple:
 
 
 # =============================================================================
-# VARIATION (direct from each row's size column)
+# VARIATION (fashion: validated size from sizes.txt; other: variation col)
 # =============================================================================
 
-def get_variation(row: pd.Series) -> str:
-  """Return the size value for this SKU directly from its row."""
-  raw = re.sub(r'"+', '', str(row.get("size",""))).strip().rstrip(".")
-  if raw.lower() in ("","nan","no size"):
-    return"size"
-  return raw
+def get_variation(
+  row: pd.Series,
+  is_fashion: bool = True,
+  valid_sizes: Optional[list] = None,
+  size_override: Optional[str] = None,
+) -> str:
+  """
+  Fashion products → use the 'size' column, try UK extraction, validate
+    against sizes.txt, or fall back to size_override / first valid match.
+  Other products  → use the 'variation' column directly; '...' if missing.
+  """
+  if not is_fashion:
+    raw = re.sub(r'"+', '', str(row.get("variation", ""))).strip().rstrip(".")
+    if raw.lower() in ("", "nan", "no size", "none"):
+      return "..."
+    return raw
+
+  # Fashion path
+  raw = re.sub(r'"+', '', str(row.get("size", ""))).strip().rstrip(".")
+  if raw.lower() in ("", "nan", "no size", "none"):
+    return size_override or "..."
+
+  # If caller provided an override (from dropdown) use it
+  if size_override:
+    return size_override
+
+  # Try to validate directly against sizes.txt
+  if valid_sizes:
+    raw_upper = raw.upper()
+    for s in valid_sizes:
+      if s.upper() == raw_upper:
+        return s
+
+  # Try UK size extraction
+  uk = extract_uk_size(raw)
+  if uk and valid_sizes:
+    uk_upper = uk.upper()
+    for s in valid_sizes:
+      if s.upper() == uk_upper:
+        return s
+    return uk  # return extracted even if not in list
+
+  # Try partial match against valid_sizes
+  if valid_sizes:
+    raw_lower = raw.lower()
+    for s in valid_sizes:
+      if s.lower() in raw_lower or raw_lower in s.lower():
+        return s
+
+  return raw  # best-effort fallback
 
 
 # =============================================================================
 # SHORT DESCRIPTION (rule-based, instant)
 # =============================================================================
 
+# Gender display labels
 GENDER_MAP = {
-  "MEN'S":"Men","WOMEN'S":"Women","BOYS'":"Boys","GIRLS'":"Girls",
-  "MEN":"Men","WOMEN":"Women","UNISEX":"Unisex","NO GENDER":"",
-  "HORSE":"",
+  "MEN'S": "Men", "WOMEN'S": "Women", "BOYS'": "Boys", "GIRLS'": "Girls",
+  "MEN": "Men", "WOMEN": "Women", "UNISEX": "Unisex", "NO GENDER": "",
+  "HORSE": "",
 }
+
+# Quality/comfort keywords to mine from the description text
+_QUALITY_KEYWORDS = [
+  "comfortable", "comfort", "lightweight", "light weight", "durable", "durability",
+  "breathable", "breathability", "flexible", "flexibility", "waterproof", "water-resistant",
+  "quick-dry", "quick dry", "moisture-wicking", "wicking", "anti-odour", "anti-odor",
+  "odour-resistant", "stretch", "stretchable", "supportive", "support", "cushioned",
+  "cushioning", "padded", "ergonomic", "adjustable", "reflective", "insulated",
+  "warm", "cool", "softness", "soft", "reinforced", "abrasion-resistant", "non-slip",
+  "grip", "ventilated", "ventilation", "seamless", "compression", "packable",
+  "ultra-light", "high-performance", "performance", "protection", "protective",
+]
+
+def _extract_quality_phrases(desc: str, max_phrases: int = 2) -> list:
+  """Pull quality/feature phrases from a description sentence."""
+  if not desc:
+    return []
+  found = []
+  used_words: set = set()
+  desc_lower = desc.lower()
+  for kw in _QUALITY_KEYWORDS:
+    if kw in desc_lower:
+      idx = desc_lower.index(kw)
+      # Grab up to 6 words but stop at sentence boundary
+      snippet = desc[idx:]
+      sentence_end = re.search(r'[.!?]', snippet)
+      if sentence_end:
+        snippet = snippet[:sentence_end.start()]
+      words_after = snippet.split()[:6]
+      phrase = " ".join(words_after).rstrip(".,;:- ")
+      phrase_words = set(phrase.lower().split())
+      if phrase and len(phrase_words) >= 3 and len(phrase_words & used_words) < 2:
+        found.append(phrase.capitalize())
+        used_words |= phrase_words
+      if len(found) >= max_phrases:
+        break
+  return found
 
 
 def rule_based_short_desc(row: pd.Series) -> str:
   bullets = []
 
-  dept  = _clean(row.get("department_label","")).replace("/","·").title()
-  sport = dept if dept else _clean(row.get("type","")).title()
-  g_raw = _clean(row.get("channable_gender","")).split("|")[0].strip().upper()
+  # --- Bullet 1: Brand · Type/Sport · Gender ---
+  brand  = _clean(row.get("brand_name", "")).title()
+  dept   = _clean(row.get("department_label", "")).replace("/", "·").title()
+  ptype  = _clean(row.get("type", "")).title()
+  sport  = dept if dept else ptype
+  g_raw  = _clean(row.get("channable_gender", "")).split("|")[0].strip().upper()
   gender = GENDER_MAP.get(g_raw, g_raw.title())
-  if sport:
-    who = f"· {gender}"if gender else""
-    bullets.append(f"{sport}{who}")
 
-  desc = _clean(row.get("designed_for",""))
-  if desc:
+  b1_parts = [p for p in [brand, sport, gender] if p]
+  if b1_parts:
+    bullets.append(" · ".join(b1_parts))
+
+  # --- Bullet 2: Quality/feature phrases mined from description ---
+  desc = _clean(row.get("designed_for", ""))
+  quality_phrases = _extract_quality_phrases(desc, max_phrases=2)
+  if quality_phrases:
+    bullets.append(" · ".join(quality_phrases))
+  elif desc:
+    # Fallback: first meaningful sentence that doesn't start with "Our team/designers"
     sentences = [s.strip() for s in re.split(r"[.!?]", desc) if len(s.strip()) > 20]
     feature = next(
       (s for s in sentences if not re.match(r"our (team|design)", s, re.I)),
-      sentences[0] if sentences else"",
+      sentences[0] if sentences else "",
     )
     if feature:
-      trunc = feature[:120].rsplit(" ", 1)[0] if len(feature) > 120 else feature
-      bullets.append(trunc)
+      trunc = feature[:110].rsplit(" ", 1)[0] if len(feature) > 110 else feature
+      bullets.append(trunc.capitalize())
 
-  color = _clean(row.get("color","")).split("|")[0].strip().title()
-  size = re.sub(r'"+',"", _clean(row.get("size",""))).strip().rstrip(".")
-  if color and size and size.lower() !="no size":
-    bullets.append(f"{color} · Size {size}")
+  # --- Bullet 3: Color · Size or nature/material label ---
+  color = _clean(row.get("color", "")).split("|")[0].strip().title()
+  size  = re.sub(r'"+', "", _clean(row.get("size", ""))).strip().rstrip(".")
+  nature = _clean(row.get("nature_label", "")).title()
+
+  if color and size and size.lower() != "no size":
+    bullets.append(f"Colour: {color} · Size: {size}")
+  elif color and nature:
+    bullets.append(f"{nature} · {color}")
   elif color:
     bullets.append(f"Colour: {color}")
-  elif size and size.lower() !="no size":
+  elif size and size.lower() != "no size":
     bullets.append(f"Size: {size}")
+  elif nature:
+    bullets.append(nature)
 
   if not bullets:
-    return""
-  items ="".join(f"<li>{b}</li>"for b in bullets[:3])
+    return ""
+  items = "".join(f"<li>{b}</li>" for b in bullets[:3])
   return f"<ul>{items}</ul>"
 
 
@@ -479,6 +626,9 @@ def build_template(
   results_df, df_cat, df_brands,
   ai_categories,
   short_descs,
+  is_fashion: bool = True,
+  valid_sizes: Optional[list] = None,
+  size_override: Optional[str] = None,
 ) -> bytes:
   wb = load_workbook(TEMPLATE_PATH)
   ws = wb["Upload Template"]
@@ -500,6 +650,17 @@ def build_template(
     sku = str(r.get("sku_num_sku_r3","")).strip()
     if mc and sku and mc not in model_to_first_sku:
       model_to_first_sku[mc] = sku
+
+  # Build export_code -> full Category Path lookup ONCE (outside row loop)
+  if df_cat is not None:
+    exp_to_fullpath: dict = {}
+    for _, _cr in df_cat.iterrows():
+      _exp = str(_cr.get("export_category", "")).strip()
+      _fp  = str(_cr.get("Category Path", "")).strip()
+      if _exp and _fp and _exp not in exp_to_fullpath:
+        exp_to_fullpath[_exp] = _fp
+  else:
+    exp_to_fullpath = {}
 
   for i, (_, src_row) in enumerate(results_df.iterrows()):
     row_idx = i + 2
@@ -550,18 +711,35 @@ def build_template(
     if pd.notna(raw_brand) and str(raw_brand).strip():
       row_data["Brand"] = match_brand(str(raw_brand), df_brands)
 
-    # Category 
+    # Category — write full Category Path (not the short export code)
     if ai_categories and i < len(ai_categories):
-      primary, secondary = ai_categories[i]
+      primary_code, secondary_code = ai_categories[i]
     else:
-      primary, secondary = keyword_match_category(src_row, df_cat)
-    if primary:
-      row_data["PrimaryCategory"]  = primary
-    if secondary:
-      row_data["AdditionalCategory"] = secondary
+      primary_code, secondary_code = keyword_match_category(src_row, df_cat)
 
-    # Variation: directly from this row's size 
-    row_data["variation"] = get_variation(src_row)
+    primary_full  = exp_to_fullpath.get(primary_code, primary_code)
+    secondary_full = exp_to_fullpath.get(secondary_code, secondary_code)
+
+    if primary_full:
+      row_data["PrimaryCategory"]   = primary_full
+    if secondary_full:
+      row_data["AdditionalCategory"] = secondary_full
+
+    # Variation: fashion → validated size; other → variation col or "..."
+    row_data["variation"] = get_variation(
+      src_row,
+      is_fashion=is_fashion,
+      valid_sizes=valid_sizes,
+      size_override=size_override,
+    )
+
+    # Price: always 100000
+    row_data["price"] = "100000"
+
+    # Color family: duplicate of color
+    color_for_family = str(src_row.get("color", "")).strip()
+    if color_for_family and color_for_family.lower() not in ("", "nan"):
+      row_data["color_family"] = color_for_family.split("|")[0].strip()
 
     # Short description 
     if short_descs and i < len(short_descs) and short_descs[i]:
@@ -634,6 +812,51 @@ with st.sidebar:
     shortlist_k  = 30
     concurrency  = 10
     ai_short_desc = False
+
+  st.markdown("---")
+  st.header("Product Type")
+  product_type = st.radio(
+    "Product type",
+    ["Fashion", "Other"],
+    index=0,
+    horizontal=True,
+    help=(
+      "Fashion: uses the 'size' column with UK-size extraction + sizes.txt validation.\n"
+      "Other: uses the 'variation' column directly (no validation)."
+    ),
+  )
+  is_fashion = product_type == "Fashion"
+
+  # Load valid sizes (from bundled file or user upload)
+  valid_sizes: list = []
+  uploaded_sizes = st.file_uploader(
+    "sizes.txt (valid sizes list)",
+    type=["txt"],
+    help="One size per line. Used to validate/select fashion sizes.",
+  )
+  if uploaded_sizes:
+    raw_sizes = uploaded_sizes.read().decode("utf-8", errors="replace")
+    valid_sizes = [l.strip() for l in raw_sizes.splitlines() if l.strip() and not l.startswith("#")]
+    st.sidebar.success(f"{len(valid_sizes)} valid sizes loaded")
+  else:
+    valid_sizes = parse_valid_sizes(SIZES_PATH)
+    if valid_sizes:
+      st.sidebar.info(f"Bundled sizes.txt: {len(valid_sizes)} sizes")
+
+  # Per-batch size override dropdown (fashion only)
+  size_override: Optional[str] = None
+  if is_fashion and valid_sizes:
+    st.markdown("**Override size for all results** *(optional)*")
+    size_choice = st.selectbox(
+      "Select size",
+      ["(auto — from master file)"] + valid_sizes,
+      index=0,
+      key="global_size_override",
+    )
+    if size_choice != "(auto — from master file)":
+      size_override = size_choice
+  else:
+    size_override = None
 
   st.markdown("---")
   st.header("Search Fields")
@@ -806,7 +1029,10 @@ if queries:
 
     # Compute derived columns for preview
     preview = combined.copy()
-    preview["_variation"]    = preview.apply(get_variation, axis=1)
+    preview["_variation"] = preview.apply(
+      lambda r: get_variation(r, is_fashion=is_fashion, valid_sizes=valid_sizes, size_override=size_override),
+      axis=1,
+    )
     preview["_short_description"] = short_descs if short_descs else [
       rule_based_short_desc(r) for _, r in preview.iterrows()
     ]
@@ -845,25 +1071,27 @@ if queries:
       c for c in extra_cols if c in preview.columns
     ]
 
+    variation_label = "Size (validated)" if is_fashion else "Variation"
+
     st.dataframe(
       preview[show_cols],
       use_container_width=True,
       hide_index=True,
       height=420,
       column_config={
-        "sku_num_sku_r3":    st.column_config.TextColumn("SKU",      width="small"),
-        "product_name":     st.column_config.TextColumn("Product",     width="large"),
-        "color":        st.column_config.TextColumn("Colour",     width="medium"),
-        "size":         st.column_config.TextColumn("Size",      width="medium"),
-        "brand_name":      st.column_config.TextColumn("Brand",      width="small"),
-        "department_label":   st.column_config.TextColumn("Department",   width="medium"),
-        "bar_code":       st.column_config.TextColumn("Barcode",     width="medium"),
-        "_variation":      st.column_config.TextColumn("Variation",    width="medium"),
-        "_primary_cat":     st.column_config.TextColumn("Primary Cat",   width="large"),
-        "_secondary_cat":    st.column_config.TextColumn("Additional Cat", width="large"),
-        "_short_description":  st.column_config.TextColumn("Short Desc",   width="large"),
-        "designed_for":     st.column_config.TextColumn("Description",   width="large"),
-        "keywords":       st.column_config.TextColumn("Keywords",    width="large"),
+        "sku_num_sku_r3":    st.column_config.TextColumn("SKU",        width="small"),
+        "product_name":     st.column_config.TextColumn("Product",       width="large"),
+        "color":        st.column_config.TextColumn("Colour",       width="medium"),
+        "size":         st.column_config.TextColumn("Size (master)",   width="medium"),
+        "brand_name":      st.column_config.TextColumn("Brand",        width="small"),
+        "department_label":   st.column_config.TextColumn("Department",     width="medium"),
+        "bar_code":       st.column_config.TextColumn("Barcode",       width="medium"),
+        "_variation":      st.column_config.TextColumn(variation_label,   width="medium"),
+        "_primary_cat":     st.column_config.TextColumn("Primary Cat",     width="large"),
+        "_secondary_cat":    st.column_config.TextColumn("Additional Cat",  width="large"),
+        "_short_description":  st.column_config.TextColumn("Short Desc",     width="large"),
+        "designed_for":     st.column_config.TextColumn("Description",     width="large"),
+        "keywords":       st.column_config.TextColumn("Keywords",       width="large"),
       },
     )
 
@@ -1045,6 +1273,9 @@ if queries:
             combined, df_cat, df_brands,
             ai_categories=merged_cats,
             short_descs=short_descs,
+            is_fashion=is_fashion,
+            valid_sizes=valid_sizes,
+            size_override=size_override,
           )
           mode_icon =""if (use_ai_matching and ai_categories) else""
           st.download_button(
