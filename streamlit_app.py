@@ -1,4 +1,4 @@
-
+<FILE filename="streamlit_app (20).py" size="50123 bytes">
 """
 Decathlon Product Lookup
 Improvements (applied per user request):
@@ -8,9 +8,9 @@ Improvements (applied per user request):
  - Preview: shows full Primary Category path only; Additional Category completely removed from frontend preview
  - sizes.txt: loaded ONLY from project folder (bundled) — no upload required
  - Fashion size editing: full editable preview of ALL SKUs using st.data_editor + SelectboxColumn so you can fix wrong sizes instantly
- - Invalid sizes (not in sizes.txt): new "Size Status" column with ❌ — rows with missing sizes are clearly marked (closest to row shading in Streamlit)
- - Template download: still outputs ONLY the filled "Upload Template" sheet (fast & clean)
- - Product name logic unchanged (still appends color with " - " when needed — example with curly apostrophe now handled cleanly)
+ - Invalid sizes (not in sizes.txt): new "Size Status" column with ❌ — rows with missing sizes are clearly marked
+ - Template download: NOW outputs ONLY the "Upload Template" sheet (all other sheets are stripped before saving)
+ - Product name logic unchanged (still appends color with " - " when needed)
 """
 
 import os, io, re, json, asyncio
@@ -298,7 +298,6 @@ def get_variation(
   Other:  size column (NEW) — '...' ONLY when size is empty
   """
   if not is_fashion:
-    # CHANGED: use 'size' column for Other products
     raw = re.sub(r'"+', '', str(row.get("size", ""))).strip().rstrip(".")
     if raw.lower() in ("", "nan", "no size", "none"):
       return "..."
@@ -594,7 +593,7 @@ def match_brand(raw: str, df_brands: pd.DataFrame) -> str:
 
 
 # =============================================================================
-# TEMPLATE BUILDER (UPDATED)
+# TEMPLATE BUILDER (UPDATED — ONLY Upload Template sheet)
 # =============================================================================
 
 def build_template(
@@ -604,7 +603,7 @@ def build_template(
   is_fashion: bool = True,
   valid_sizes: Optional[list] = None,
   size_override: Optional[str] = None,
-  sku_to_size_override: Optional[dict] = None,   # NEW: per-SKU size editing
+  sku_to_size_override: Optional[dict] = None,
 ) -> bytes:
   wb = load_workbook(TEMPLATE_PATH)
   ws = wb["Upload Template"]
@@ -719,6 +718,11 @@ def build_template(
         cell.value   = value
         cell.font   = data_font
         cell.alignment = data_align
+
+  # === CRITICAL CHANGE: Keep ONLY the "Upload Template" sheet ===
+  for sheet_name in list(wb.sheetnames):
+    if sheet_name != "Upload Template":
+      wb.remove(wb[sheet_name])
 
   buf = io.BytesIO()
   wb.save(buf)
@@ -1040,7 +1044,6 @@ if queries:
     # Editable preview for Fashion (per request)
     sku_to_size_override = None
     if is_fashion and valid_sizes:
-      # Make size column a dropdown so user can fix wrong sizes
       column_config_dict["_variation"] = st.column_config.SelectboxColumn(
         variation_label,
         options=["..."] + valid_sizes,
@@ -1048,7 +1051,6 @@ if queries:
       )
       column_config_dict["_size_status"] = st.column_config.TextColumn("Size Status", width="small")
 
-      # Add any extra columns
       for c in [col for col in show_cols if col not in column_config_dict]:
         column_config_dict[c] = st.column_config.TextColumn(c.replace("_"," ").title(), width="medium")
 
@@ -1059,7 +1061,6 @@ if queries:
         height=420,
         column_config=column_config_dict,
       )
-      # Capture edited sizes for template export
       sku_to_size_override = {
         str(k).strip(): v 
         for k, v in zip(edited_df["sku_num_sku_r3"], edited_df["_variation"])
@@ -1241,16 +1242,17 @@ if queries:
             is_fashion=is_fashion,
             valid_sizes=valid_sizes,
             size_override=None,
-            sku_to_size_override=sku_to_size_override,   # passes edited sizes
+            sku_to_size_override=sku_to_size_override,
           )
           st.download_button(
-            "Download Filled Upload Template (.xlsx)",
+            "✅ Download Upload Template Sheet ONLY (.xlsx)",
             data=tpl_bytes,
             file_name="decathlon_upload_template_filled.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             type="primary",
           )
+          st.caption("The downloaded file contains **only** the Upload Template sheet (all other sheets removed).")
         except FileNotFoundError:
           st.warning(
             "Template file not found."
@@ -1259,4 +1261,6 @@ if queries:
 else:
   st.info("Upload a list or type search terms above to get started.")
 
-
+st.markdown("---")
+st.caption("Decathlon Product Lookup · Powered by your Decathlon working file")
+</FILE>
