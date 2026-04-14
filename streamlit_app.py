@@ -797,14 +797,29 @@ if queries:
         preview["_short_description"] = short_descs if short_descs else [
             rule_based_short_desc(r) for _, r in preview.iterrows()
         ]
-        # Category preview (before overrides)
+
+        # Build export_to_path lookup for preview display
+        if df_cat is not None:
+            _exp_to_path = {}
+            for _, _rc in df_cat.iterrows():
+                _e = str(_rc.get("export_category", "")).strip()
+                _p = str(_rc.get("Category Path", "")).strip()
+                if _e and _p and _e not in _exp_to_path:
+                    _exp_to_path[_e] = _p
+        else:
+            _exp_to_path = {}
+
+        def _code_to_path(code):
+            return _exp_to_path.get(str(code).strip(), code) if code else ""
+
+        # Category preview (before overrides) — show full path
         if ai_categories:
-            preview["_primary_cat"]   = [c[0] for c in ai_categories]
-            preview["_secondary_cat"] = [c[1] for c in ai_categories]
+            preview["_primary_cat"]   = [_code_to_path(c[0]) for c in ai_categories]
+            preview["_secondary_cat"] = [_code_to_path(c[1]) for c in ai_categories]
         elif df_cat is not None:
             kw = keyword_match_batch(preview, df_cat)
-            preview["_primary_cat"]   = [c[0] for c in kw]
-            preview["_secondary_cat"] = [c[1] for c in kw]
+            preview["_primary_cat"]   = [_code_to_path(c[0]) for c in kw]
+            preview["_secondary_cat"] = [_code_to_path(c[1]) for c in kw]
         else:
             preview["_primary_cat"]   = ""
             preview["_secondary_cat"] = ""
@@ -846,29 +861,53 @@ if queries:
             st.subheader(f"🗂 Category Editor — {mode_label}")
             st.caption(
                 "Categories are shared across all SKUs with the same model code. "
-                "Edit one SKU per model — siblings update automatically on export."
+                "Edit one row per model — siblings update automatically on export."
             )
 
-            all_export_cats            = sorted(df_cat["export_category"].dropna().unique().tolist())
-            all_export_cats_with_blank = ["(auto)"] + all_export_cats
+            # ── Build two-way lookup: export_category <-> full Category Path ──
+            # export_to_path: short code -> full path label shown in UI
+            # path_to_export_code: full path label -> short code stored/written
+            export_to_path: dict = {}
+            for _, row_c in df_cat.iterrows():
+                exp  = str(row_c.get("export_category", "")).strip()
+                path = str(row_c.get("Category Path", "")).strip()
+                if exp and path and exp not in export_to_path:
+                    export_to_path[exp] = path
+            path_label_to_export: dict = {v: k for k, v in export_to_path.items()}
+
+            def export_to_label(code: str) -> str:
+                """Convert export_category code -> full Category Path for display."""
+                if not code:
+                    return ""
+                return export_to_path.get(code, code)   # fallback: show code if no path found
+
+            def label_to_export(label: str) -> str:
+                """Convert full Category Path label -> export_category code for storage."""
+                if not label or label == "(auto)":
+                    return ""
+                return path_label_to_export.get(label, label)
+
+            # All full-path labels, sorted, for the dropdowns
+            all_path_labels     = sorted(export_to_path.values())
+            all_labels_w_blank  = ["(auto)"] + all_path_labels
 
             if "cat_overrides" not in st.session_state:
-                st.session_state.cat_overrides = {}   # keyed by model_code
+                st.session_state.cat_overrides = {}   # keyed by model_code; stores export codes
 
-            # Search filter
+            # Search filter — searches across the full path text
             cat_search = st.text_input(
                 "🔍 Filter category list",
                 placeholder="e.g. football, running, kids...",
                 key="cat_search",
             )
-            filtered_cats = (
-                ["(auto)"] + [c for c in all_export_cats if cat_search.strip().lower() in c.lower()]
-                if cat_search.strip()
-                else all_export_cats_with_blank
+            q = cat_search.strip().lower()
+            filtered_labels = (
+                ["(auto)"] + [lbl for lbl in all_path_labels if q in lbl.lower()]
+                if q else all_labels_w_blank
             )
             st.caption(
-                f"{len(filtered_cats)-1} categories shown"
-                + (f" matching '{cat_search}'" if cat_search.strip() else " (all)")
+                f"{len(filtered_labels)-1} categories shown"
+                + (f" matching '{cat_search}'" if q else " (all)")
                 + f" · {len(st.session_state.cat_overrides)} model override(s)"
             )
             st.markdown("---")
@@ -891,48 +930,58 @@ if queries:
                 name      = str(prow.get("product_name", ""))[:40]
 
                 if ai_categories:
-                    # Find the index of the first row for this model
                     first_idx = next(
                         j for j, (_, r) in enumerate(combined.iterrows())
                         if str(r.get("model_code", "")).strip() == mc
                     )
-                    auto_prim, auto_addl = ai_categories[first_idx]
+                    auto_prim_code, auto_addl_code = ai_categories[first_idx]
                 else:
-                    auto_prim, auto_addl = keyword_match_category(prow, df_cat)
+                    auto_prim_code, auto_addl_code = keyword_match_category(prow, df_cat)
 
-                override  = st.session_state.cat_overrides.get(mc, {})
+                # Convert auto codes to full-path labels for display
+                auto_prim_label = export_to_label(auto_prim_code)
+                auto_addl_label = export_to_label(auto_addl_code)
+
+                override = st.session_state.cat_overrides.get(mc, {})
+                # Override stores export codes; convert to labels for UI
+                cur_prim_label = export_to_label(override.get("primary", auto_prim_code)) or auto_prim_label
+                cur_addl_label = export_to_label(override.get("additional", auto_addl_code)) or auto_addl_label
 
                 c1, c2, c3, c4 = st.columns([2, 3, 3, 1])
                 c1.markdown(f"**{mc}**  \n{name}  \n`{sku_count} SKU(s)`")
 
-                cur_prim  = override.get("primary", auto_prim)
+                # Primary dropdown — show full path labels
                 prim_opts = (
-                    filtered_cats if cur_prim in filtered_cats
-                    else ["(auto)", cur_prim] + [c for c in filtered_cats if c != "(auto)"]
+                    filtered_labels if cur_prim_label in filtered_labels
+                    else ["(auto)", cur_prim_label] + [l for l in filtered_labels if l != "(auto)"]
                 )
-                try:    prim_idx = prim_opts.index(cur_prim)
+                try:    prim_idx = prim_opts.index(cur_prim_label)
                 except ValueError: prim_idx = 0
-                new_prim = c2.selectbox(
+                new_prim_label = c2.selectbox(
                     f"Primary #{mc}", prim_opts,
                     index=prim_idx, label_visibility="collapsed", key=f"prim_{mc}",
                 )
 
-                cur_addl  = override.get("additional", auto_addl)
+                # Additional dropdown — show full path labels
                 addl_opts = (
-                    filtered_cats if cur_addl in filtered_cats
-                    else ["(auto)", cur_addl] + [c for c in filtered_cats if c != "(auto)"]
+                    filtered_labels if cur_addl_label in filtered_labels
+                    else ["(auto)", cur_addl_label] + [l for l in filtered_labels if l != "(auto)"]
                 )
-                try:    addl_idx = addl_opts.index(cur_addl)
+                try:    addl_idx = addl_opts.index(cur_addl_label)
                 except ValueError: addl_idx = 0
-                new_addl = c3.selectbox(
+                new_addl_label = c3.selectbox(
                     f"Additional #{mc}", addl_opts,
                     index=addl_idx, label_visibility="collapsed", key=f"addl_{mc}",
                 )
 
-                if new_prim != "(auto)" or new_addl != "(auto)":
+                # Store back as export codes
+                new_prim_code = label_to_export(new_prim_label) if new_prim_label != "(auto)" else auto_prim_code
+                new_addl_code = label_to_export(new_addl_label) if new_addl_label != "(auto)" else auto_addl_code
+
+                if new_prim_label != "(auto)" or new_addl_label != "(auto)":
                     st.session_state.cat_overrides[mc] = {
-                        "primary":    auto_prim if new_prim == "(auto)" else new_prim,
-                        "additional": auto_addl if new_addl == "(auto)" else new_addl,
+                        "primary":    new_prim_code,
+                        "additional": new_addl_code,
                     }
                 elif mc in st.session_state.cat_overrides:
                     del st.session_state.cat_overrides[mc]
