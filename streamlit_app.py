@@ -798,90 +798,161 @@ if queries:
             # Rule-based fallback (instant)
             short_descs = [rule_based_short_desc(row) for _, row in combined.iterrows()]
 
-        # ── 3. Category & Brand preview with manual override ───────────────────
+        # ── 3. Results table — inline, always visible ────────────────────────
+        st.markdown("---")
+        st.subheader(f"📋 Results — {total_rows} SKU(s)")
+
+        # Build display columns: key fields first, images last
+        priority_cols = ["sku_num_sku_r3", "product_name", "color", "size",
+                         "brand_name", "department_label", "bar_code"]
+        show_cols = [c for c in priority_cols if c in combined.columns]
+        show_cols += [c for c in data_cols if c not in show_cols and c != "Search Term"]
+
+        st.dataframe(
+            combined[show_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "sku_num_sku_r3":    st.column_config.TextColumn("SKU",          width="small"),
+                "product_name":      st.column_config.TextColumn("Product",      width="large"),
+                "color":             st.column_config.TextColumn("Colour",       width="medium"),
+                "size":              st.column_config.TextColumn("Size",         width="medium"),
+                "brand_name":        st.column_config.TextColumn("Brand",        width="small"),
+                "department_label":  st.column_config.TextColumn("Department",   width="medium"),
+                "bar_code":          st.column_config.TextColumn("Barcode",      width="medium"),
+                "designed_for":      st.column_config.TextColumn("Description",  width="large"),
+                "keywords":          st.column_config.TextColumn("Keywords",     width="large"),
+            },
+        )
+
+        # ── Images ────────────────────────────────────────────────────────────
+        if show_images and img_cols_present:
+            st.markdown("---")
+            st.subheader("🖼 Product Images")
+            img_cols_ui = st.columns(min(total_rows, 4))
+            shown = 0
+            for _, prow in combined.iterrows():
+                if shown >= total_rows:
+                    break
+                img_urls = [
+                    str(prow[c]) for c in img_cols_present
+                    if pd.notna(prow.get(c)) and str(prow.get(c, "")).startswith("http")
+                ][:max_images]
+                if img_urls:
+                    col_ui = img_cols_ui[shown % len(img_cols_ui)]
+                    sku    = str(prow.get("sku_num_sku_r3", "")).strip()
+                    name   = str(prow.get("product_name", ""))[:40]
+                    col_ui.markdown(f"**{sku}** {name}")
+                    try:
+                        resp = requests.get(img_urls[0], timeout=6)
+                        img  = Image.open(io.BytesIO(resp.content))
+                        col_ui.image(img, use_container_width=True)
+                    except Exception:
+                        col_ui.markdown(f"[🔗 Image]({img_urls[0]})")
+                    shown += 1
+
+        # ── 4. Category editor — always visible, with search ──────────────────
         if df_cat is not None:
+            st.markdown("---")
             mode_label = "🤖 AI" if (use_ai_matching and ai_categories) else "🔑 Keyword"
-            with st.expander(f"{mode_label} — Category, Variation & Description Preview", expanded=False):
+            st.subheader(f"🗂 Categories — {mode_label}")
 
-                all_export_cats             = sorted(df_cat["export_category"].dropna().unique().tolist())
-                all_export_cats_with_blank  = ["(auto)"] + all_export_cats
+            all_export_cats            = sorted(df_cat["export_category"].dropna().unique().tolist())
+            all_export_cats_with_blank = ["(auto)"] + all_export_cats
 
-                if "cat_overrides" not in st.session_state:
-                    st.session_state.cat_overrides = {}
+            if "cat_overrides" not in st.session_state:
+                st.session_state.cat_overrides = {}
 
-                st.markdown(
-                    "**Override categories per row** — choose `(auto)` to keep the matched value."
+            # Category search filter
+            cat_search = st.text_input(
+                "🔍 Filter category list",
+                placeholder="e.g. football, running, kids...",
+                help="Type to narrow down the category dropdowns below",
+                key="cat_search",
+            )
+            if cat_search.strip():
+                filtered_cats = ["(auto)"] + [
+                    c for c in all_export_cats
+                    if cat_search.strip().lower() in c.lower()
+                ]
+            else:
+                filtered_cats = all_export_cats_with_blank
+
+            st.caption(
+                f"{len(filtered_cats)-1} categories shown"
+                + (f" matching '{cat_search}'" if cat_search.strip() else " (all)")
+                + f" · {len(st.session_state.cat_overrides)} manual override(s)"
+            )
+            st.markdown("---")
+
+            # Header row
+            hc1, hc2, hc3, hc4, hc5, hc6 = st.columns([2, 3, 3, 1, 1, 2])
+            hc1.markdown("**SKU · Product**")
+            hc2.markdown("**Primary Category**")
+            hc3.markdown("**Additional Category**")
+            hc4.markdown("**Variation**")
+            hc5.markdown("**Method**")
+            hc6.markdown("**Short Description**")
+
+            for i, (_, prow) in enumerate(combined.iterrows()):
+                if use_ai_matching and ai_categories:
+                    auto_prim, auto_addl = ai_categories[i]
+                else:
+                    auto_prim, auto_addl = keyword_match_category(prow, df_cat)
+
+                override = st.session_state.cat_overrides.get(i, {})
+                sku      = str(prow.get("sku_num_sku_r3", "")).strip()
+                name     = str(prow.get("product_name", ""))[:45]
+                var_val  = variation_map.get(sku, "size")
+                sd_val   = short_descs[i] if short_descs else ""
+
+                c1, c2, c3, c4, c5, c6 = st.columns([2, 3, 3, 1, 1, 2])
+                c1.markdown(f"**{sku}**  \n{name}")
+
+                # Primary category — use filtered list
+                cur_prim = override.get("primary", auto_prim)
+                # If current value not in filtered list, add it so it doesn't reset
+                prim_opts = filtered_cats if cur_prim in filtered_cats else ["(auto)", cur_prim] + [c for c in filtered_cats if c != "(auto)"]
+                try:
+                    prim_idx = prim_opts.index(cur_prim)
+                except ValueError:
+                    prim_idx = 0
+                new_prim = c2.selectbox(
+                    f"Primary #{i}", prim_opts,
+                    index=prim_idx, label_visibility="collapsed", key=f"prim_{i}",
                 )
-                st.markdown("---")
 
-                hc1, hc2, hc3, hc4, hc5, hc6 = st.columns([2, 3, 3, 1, 1, 2])
-                hc1.markdown("**Product**")
-                hc2.markdown("**Primary Category**")
-                hc3.markdown("**Additional Category**")
-                hc4.markdown("**Variation**")
-                hc5.markdown("**Method**")
-                hc6.markdown("**Short Description**")
-
-                for i, (_, prow) in enumerate(combined.iterrows()):
-                    if use_ai_matching and ai_categories:
-                        auto_prim, auto_addl = ai_categories[i]
-                    else:
-                        auto_prim, auto_addl = keyword_match_category(prow, df_cat)
-
-                    override = st.session_state.cat_overrides.get(i, {})
-                    sku      = str(prow.get("sku_num_sku_r3", "")).strip()
-                    var_val  = variation_map.get(sku, "size")
-                    sd_val   = short_descs[i] if short_descs else ""
-
-                    c1, c2, c3, c4, c5, c6 = st.columns([2, 3, 3, 1, 1, 2])
-                    c1.markdown(
-                        f"**{sku}**  \n"
-                        f"{str(prow.get('product_name', ''))[:50]}"
-                    )
-
-                    cur_prim = override.get("primary", auto_prim)
-                    try:
-                        prim_idx = all_export_cats_with_blank.index(cur_prim)
-                    except ValueError:
-                        prim_idx = 0
-                    new_prim = c2.selectbox(
-                        f"Primary #{i}", all_export_cats_with_blank,
-                        index=prim_idx, label_visibility="collapsed", key=f"prim_{i}",
-                    )
-
-                    cur_addl = override.get("additional", auto_addl)
-                    try:
-                        addl_idx = all_export_cats_with_blank.index(cur_addl)
-                    except ValueError:
-                        addl_idx = 0
-                    new_addl = c3.selectbox(
-                        f"Additional #{i}", all_export_cats_with_blank,
-                        index=addl_idx, label_visibility="collapsed", key=f"addl_{i}",
-                    )
-
-                    c4.markdown(f"`{var_val}`")
-
-                    if new_prim != "(auto)" or new_addl != "(auto)":
-                        st.session_state.cat_overrides[i] = {
-                            "primary":    auto_prim if new_prim == "(auto)" else new_prim,
-                            "additional": auto_addl if new_addl == "(auto)" else new_addl,
-                        }
-                    elif i in st.session_state.cat_overrides:
-                        del st.session_state.cat_overrides[i]
-
-                    badge = "🖊️ Manual" if i in st.session_state.cat_overrides else (
-                        "🤖 AI" if (use_ai_matching and ai_categories) else "🔑 Keyword"
-                    )
-                    c5.markdown(f"`{badge}`")
-                    c6.markdown(sd_val.replace("\n", "  \n") if sd_val else "_—_")
-
-                st.markdown("---")
-                st.caption(
-                    f"Total rows: {len(combined)} · "
-                    f"Overrides: {len(st.session_state.cat_overrides)}"
+                # Additional category — use filtered list
+                cur_addl = override.get("additional", auto_addl)
+                addl_opts = filtered_cats if cur_addl in filtered_cats else ["(auto)", cur_addl] + [c for c in filtered_cats if c != "(auto)"]
+                try:
+                    addl_idx = addl_opts.index(cur_addl)
+                except ValueError:
+                    addl_idx = 0
+                new_addl = c3.selectbox(
+                    f"Additional #{i}", addl_opts,
+                    index=addl_idx, label_visibility="collapsed", key=f"addl_{i}",
                 )
+
+                c4.markdown(f"`{var_val}`")
+
+                # Save overrides
+                if new_prim != "(auto)" or new_addl != "(auto)":
+                    st.session_state.cat_overrides[i] = {
+                        "primary":    auto_prim if new_prim == "(auto)" else new_prim,
+                        "additional": auto_addl if new_addl == "(auto)" else new_addl,
+                    }
+                elif i in st.session_state.cat_overrides:
+                    del st.session_state.cat_overrides[i]
+
+                badge = "🖊️ Manual" if i in st.session_state.cat_overrides else (
+                    "🤖 AI" if (use_ai_matching and ai_categories) else "🔑 Keyword"
+                )
+                c5.markdown(f"`{badge}`")
+                c6.markdown(sd_val.replace("\n", "  \n") if sd_val else "_—_")
 
         # ── Download buttons ───────────────────────────────────────────────────
+        st.markdown("---")
         col_dl1, col_dl2 = st.columns(2)
 
         with col_dl1:
@@ -901,7 +972,6 @@ if queries:
                 st.warning("deca_cat.xlsx not loaded — template download unavailable.")
             else:
                 try:
-                    # Merge session-state overrides on top of AI/keyword categories
                     merged_cats = []
                     for i, (_, prow) in enumerate(combined.iterrows()):
                         override = st.session_state.get("cat_overrides", {}).get(i)
@@ -932,55 +1002,6 @@ if queries:
                         "Template file not found. "
                         "Place `product-creation-template.xlsx` in the app folder."
                     )
-
-        st.markdown("---")
-
-        # ── Per-query result cards ─────────────────────────────────────────────
-        for q, res in all_result_frames:
-            with st.expander(f"🔍 **{q}**  —  {len(res)} row(s)", expanded=True):
-                show_cols = ["Search Term"] + [c for c in data_cols if c in res.columns]
-                st.dataframe(
-                    res[show_cols],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "keywords":     st.column_config.TextColumn("keywords",     width="large"),
-                        "product_name": st.column_config.TextColumn("product_name", width="large"),
-                        "designed_for": st.column_config.TextColumn("designed_for", width="large"),
-                    },
-                )
-
-                cats = set()
-                for _, row in res.iterrows():
-                    for col in ["department_label", "nature_label", "family", "type"]:
-                        val = row.get(col, "")
-                        if pd.notna(val) and str(val).strip():
-                            cats.add(str(val).strip())
-                if cats:
-                    tags = " ".join(f'<span class="tag">{c}</span>' for c in sorted(cats))
-                    st.markdown(f"**Categories & Types:** {tags}", unsafe_allow_html=True)
-
-                if show_images and img_cols_present:
-                    first_row = res.iloc[0]
-                    img_urls  = [
-                        str(first_row[c]) for c in img_cols_present
-                        if pd.notna(first_row.get(c))
-                        and str(first_row.get(c, "")).startswith("http")
-                    ][:max_images]
-                    if img_urls:
-                        st.markdown("**🖼 Product Images**")
-                        cols = st.columns(len(img_urls))
-                        for i, url in enumerate(img_urls):
-                            try:
-                                resp = requests.get(url, timeout=6)
-                                img  = Image.open(io.BytesIO(resp.content))
-                                cols[i].image(
-                                    img,
-                                    caption="Main" if i == 0 else f"View {i}",
-                                    use_container_width=True,
-                                )
-                            except Exception:
-                                cols[i].markdown(f"[🔗 Image {i+1}]({url})")
 else:
     st.info("👆 Upload a list or type search terms above to get started.")
 
