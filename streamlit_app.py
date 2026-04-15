@@ -54,7 +54,7 @@ st.markdown("Search by SKU number — view details, images, and **download a fil
 IMAGE_COLS   = ["OG_image"] + [f"picture_{i}" for i in range(1, 11)]
 TEMPLATE_PATH = "product-creation-template.xlsx"
 DECA_CAT_PATH = "deca_cat.xlsx"
-MASTER_PATH   = "Decathlon_Working_File_Split.csv"
+MASTER_PATH   = "Decathlon Working File Split.xlsx"
 SIZES_PATH    = "sizes.txt"
 
 MASTER_TO_TEMPLATE = {
@@ -198,14 +198,32 @@ def load_reference_data(file_bytes: bytes):
     return df_cat, df_brands
 
 
+# Alternate column names that should be treated as the SKU column
+_SKU_ALIASES = {"seller sku", "sellersku", "seller_sku", "sku", "sku_num_sku_r3"}
+
+
+def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename alternate SKU column names to the canonical 'sku_num_sku_r3'."""
+    rename = {}
+    for col in df.columns:
+        if col.lower().replace(" ", "_") in _SKU_ALIASES and col != "sku_num_sku_r3":
+            rename[col] = "sku_num_sku_r3"
+            break  # only rename the first match to avoid duplicates
+    if rename:
+        df = df.rename(columns=rename)
+    return df
+
+
 @st.cache_data(show_spinner=False)
 def load_master(file_bytes: bytes, is_csv: bool) -> pd.DataFrame:
     if is_csv:
         try:
-            return pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="utf-8")
+            df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="utf-8")
         except UnicodeDecodeError:
-            return pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="latin-1")
-    return pd.read_excel(io.BytesIO(file_bytes), dtype=str)
+            df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, encoding="latin-1")
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes), dtype=str)
+    return _normalise_columns(df)
 
 
 # =============================================================================
@@ -727,7 +745,8 @@ def build_template(
         if secondary_full:
             row_data["AdditionalCategory"] = secondary_full
 
-        # Variation: per-row override takes priority, then auto
+        # Size/Variation: per-row override takes priority, then auto
+        # Fashion writes to 'size' column; Other writes to 'variation' column
         per_row_override = (size_overrides or {}).get(idx)
         computed_var = get_variation(
             src_row,
@@ -735,7 +754,10 @@ def build_template(
             valid_sizes=valid_sizes,
             size_override=per_row_override,
         )
-        row_data["variation"] = computed_var
+        if is_fashion:
+            row_data["size"]      = computed_var
+        else:
+            row_data["variation"] = computed_var
 
         # Price_KES: always 100,000
         row_data["price"]     = "100000"
@@ -881,7 +903,7 @@ if uploaded_master:
     st.sidebar.success(f"{len(df_master):,} product rows loaded")
 else:
     loaded = False
-    for path, csv in [(MASTER_PATH, True), (MASTER_PATH.replace(".csv", ".xlsx"), False)]:
+    for path, csv in [(MASTER_PATH, False), (MASTER_PATH.replace(".xlsx", ".csv"), True)]:
         try:
             master_bytes = open(path, "rb").read()
             is_csv       = csv
@@ -892,7 +914,7 @@ else:
         except FileNotFoundError:
             continue
     if not loaded:
-        st.error("No master file found. Upload one in the sidebar.")
+        st.error(f"Master file not found. Place '{MASTER_PATH}' in the same folder as app.py.")
         st.stop()
 
 img_cols_present = [c for c in IMAGE_COLS if c in df_master.columns]
