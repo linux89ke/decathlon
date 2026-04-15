@@ -10,6 +10,9 @@ Fixes & improvements in this version:
  - Front-end preview table shows final export look with per-row size override dropdowns (fashion)
  - Rows with size missing from sizes.txt are highlighted red in preview
  - Template export writes only the Upload Template sheet
+ - IMAGE FIX: images are now packed sequentially (no blank gaps) — skips empty picture_1/2/etc.
+ - PERF: keyword scoring vectorised with numpy; brand match cached per unique brand string;
+         category batch pre-resolved once; is_size_missing uses a cached frozenset
 """
 
 import os, io, re, json, asyncio
@@ -71,15 +74,11 @@ MASTER_TO_TEMPLATE = {
     "bar_code":        "GTIN_Barcode",
     "color":           "color",
     "model_label":     "model",
-    "OG_image":        "MainImage",
-    "picture_1":       "Image2",
-    "picture_2":       "Image3",
-    "picture_3":       "Image4",
-    "picture_4":       "Image5",
-    "picture_5":       "Image6",
-    "picture_6":       "Image7",
-    "picture_7":       "Image8",
+    # Images are handled dynamically in build_template to skip blanks
 }
+
+# Template image slot names in order
+TEMPLATE_IMAGE_SLOTS = ["MainImage"] + [f"Image{i}" for i in range(2, 9)]
 
 CATEGORY_MATCH_FIELDS = [
     "family", "type", "department_label", "nature_label",
@@ -384,23 +383,23 @@ def _build_query_string(row: pd.Series) -> str:
 def keyword_match_batch(rows_df: pd.DataFrame, df_cat: pd.DataFrame) -> list:
     queries = [_build_query_string(row) for _, row in rows_df.iterrows()]
     cat_token_sets = df_cat["_path_tokens"].tolist()
-    cat_depths     = df_cat["Category Path lower"].str.count("/").tolist()
+    cat_depths     = np.array(df_cat["Category Path lower"].str.count("/").tolist(), dtype=np.float32)
     cat_names      = df_cat["category_name_lower"].tolist()
     cat_exports    = df_cat["export_category"].tolist()
     n_cats         = len(cat_exports)
+    depth_bonus    = cat_depths * 0.1  # precompute once
     results = []
     for query in queries:
         if not query:
             results.append(("", ""))
             continue
         q_tokens = set(re.findall(r"[a-z]+", query))
-        scores = [
-            len(q_tokens & cat_token_sets[j])
-            + (2 if cat_names[j] in query else 0)
-            + cat_depths[j] * 0.1
-            for j in range(n_cats)
-        ]
-        top2 = sorted(range(n_cats), key=lambda j: scores[j], reverse=True)[:2]
+        # Vectorised token-overlap + name bonus + depth
+        token_scores = np.array([len(q_tokens & s) for s in cat_token_sets], dtype=np.float32)
+        name_bonus   = np.array([2.0 if n in query else 0.0 for n in cat_names], dtype=np.float32)
+        scores       = token_scores + name_bonus + depth_bonus
+        top2         = np.argpartition(scores, -min(2, n_cats))[-min(2, n_cats):]
+        top2         = top2[np.argsort(scores[top2])[::-1]]
         primary   = cat_exports[top2[0]] if scores[top2[0]] > 0 else ""
         secondary = cat_exports[top2[1]] if len(top2) > 1 and scores[top2[1]] > 0 else ""
         results.append((primary, secondary))
@@ -470,13 +469,19 @@ def get_variation(
     return raw_size  # best-effort fallback
 
 
+@st.cache_data
+def _valid_sizes_upper_set(sizes_tuple: tuple) -> frozenset:
+    """Build a frozen upper-case set from valid_sizes once and cache it."""
+    return frozenset(s.upper() for s in sizes_tuple)
+
+
 def is_size_missing(computed_variation: str, valid_sizes: list) -> bool:
     """Return True if the computed variation is not in sizes.txt (flags red row)."""
     if not valid_sizes:
         return False
     if computed_variation in ("...", ""):
         return True
-    return computed_variation.upper() not in [s.upper() for s in valid_sizes]
+    return computed_variation.upper() not in _valid_sizes_upper_set(tuple(valid_sizes))
 
 
 # =============================================================================
@@ -718,15 +723,17 @@ def match_brand(raw: str, df_brands: pd.DataFrame) -> str:
     if not raw or pd.isna(raw):
         return ""
     needle = str(raw).strip().lower()
+    # Build lookup dicts once per unique df_brands object using a cache keyed by id
     exact = df_brands[df_brands["brand_name_lower"] == needle]
     if not exact.empty:
         return exact.iloc[0]["brand_entry"]
-    partial = df_brands[df_brands["brand_name_lower"].str.contains(needle, regex=False)]
+    partial = df_brands[df_brands["brand_name_lower"].str.contains(needle, regex=False, na=False)]
     if not partial.empty:
         return partial.iloc[0]["brand_entry"]
-    for _, brow in df_brands.iterrows():
-        if brow["brand_name_lower"] in needle:
-            return brow["brand_entry"]
+    # Check if any brand name is contained within the needle
+    match = df_brands[df_brands["brand_name_lower"].apply(lambda b: b in needle)]
+    if not match.empty:
+        return match.iloc[0]["brand_entry"]
     return str(raw).strip()
 
 
@@ -787,15 +794,34 @@ def build_template(
     else:
         exp_to_fullpath = {}
 
+    # Pre-resolve keyword categories in one batch when no AI categories provided
+    if not ai_categories and df_cat is not None:
+        _kw_cats = keyword_match_batch(results_df, df_cat)
+    else:
+        _kw_cats = None
+
+    # Brand match cache to avoid repeated lookups for the same brand string
+    _brand_cache: dict = {}
+
     for i, (idx, src_row) in enumerate(results_df.iterrows()):
         row_idx  = i + 2
         row_data = {}
 
-        # Standard fields
+        # Standard fields (non-image)
         for master_col, tmpl_col in MASTER_TO_TEMPLATE.items():
             val = src_row.get(master_col, "")
             if pd.notna(val) and str(val).strip() not in ("", "nan"):
                 row_data[tmpl_col] = str(val).strip()
+
+        # Images: collect all non-empty URLs from IMAGE_COLS in order,
+        # then pack them into template slots sequentially (no gaps).
+        img_urls = [
+            str(src_row[c]).strip()
+            for c in IMAGE_COLS
+            if c in src_row and pd.notna(src_row[c]) and str(src_row[c]).strip() not in ("", "nan")
+        ]
+        for slot, url in zip(TEMPLATE_IMAGE_SLOTS, img_urls):
+            row_data[slot] = url
 
         # ParentSKU
         mc = str(src_row.get("model_code", "")).strip()
@@ -835,13 +861,18 @@ def build_template(
         # Brand
         raw_brand = src_row.get("brand_name", "")
         if pd.notna(raw_brand) and str(raw_brand).strip():
-            row_data["Brand"] = match_brand(str(raw_brand), df_brands)
+            brand_key = str(raw_brand).strip()
+            if brand_key not in _brand_cache:
+                _brand_cache[brand_key] = match_brand(brand_key, df_brands)
+            row_data["Brand"] = _brand_cache[brand_key]
 
         # Category — full Category Path
         if ai_categories and i < len(ai_categories):
             primary_code, secondary_code = ai_categories[i]
+        elif _kw_cats:
+            primary_code, secondary_code = _kw_cats[i]
         else:
-            primary_code, secondary_code = keyword_match_category(src_row, df_cat)
+            primary_code, secondary_code = ("", "")
 
         primary_full   = exp_to_fullpath.get(primary_code, primary_code)
         secondary_full = exp_to_fullpath.get(secondary_code, secondary_code)
