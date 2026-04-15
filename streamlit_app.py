@@ -15,6 +15,7 @@ Fixes & improvements in this version:
          category batch pre-resolved once; is_size_missing uses a cached frozenset
  - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
  - MASTER MAPPING: Description pulls directly from the 'description' column.
+ - SIZE/VARIATION STRICT: Fills either Size OR Variation exclusively based on mode. Color Family left empty.
 """
 
 import os, io, re, json, asyncio
@@ -70,7 +71,7 @@ SIZES_PATH    = "sizes.txt"
 
 MASTER_TO_TEMPLATE = {
     "product_name":    "Name",
-    "description":     "Description",  # Fixed to point to the actual description column
+    "description":     "Description",  
     "sku_num_sku_r3":  "SellerSKU",
     "brand_name":      "Brand",
     "bar_code":        "GTIN_Barcode",
@@ -542,7 +543,7 @@ def rule_based_short_desc(row: pd.Series) -> str:
     b1_parts = [p for p in [brand, sport, gender] if p]
     if b1_parts:
         bullets.append(" · ".join(b1_parts))
-    desc = _clean(row.get("description", ""))  # Fixed to use 'description'
+    desc = _clean(row.get("description", ""))  
     quality_phrases = _extract_quality_phrases(desc, max_phrases=2)
     if quality_phrases:
         bullets.append(" · ".join(quality_phrases))
@@ -676,7 +677,7 @@ def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
         _clean(row.get("department_label", "")),
         _clean(row.get("brand_name", "")),
         _clean(row.get("channable_gender", "")).split("|")[0].strip(),
-        _clean(row.get("description", ""))[:300],  # Fixed to use 'description'
+        _clean(row.get("description", ""))[:300],  
         _clean(row.get("keywords", ""))[:100],
     ]
     return "|".join(p for p in parts if p)
@@ -899,10 +900,9 @@ def build_template(
         var_header  = next((h for h in header_map if str(h).lower() == "variation"), "variation")
 
         if is_fashion:
-            row_data[size_header] = computed_var
-            row_data[var_header]  = computed_var  # Fills both Size and Variation so nothing is blank!
+            row_data[size_header] = computed_var   # Fills ONLY Size in Fashion mode
         else:
-            row_data[var_header]  = computed_var
+            row_data[var_header]  = computed_var   # Fills ONLY Variation in Other mode
 
         # Price_KES: always 100,000
         row_data["price"]     = "100000"
@@ -912,10 +912,7 @@ def build_template(
         row_data["Stock"]     = "0"
         row_data["stock"]     = "0"
 
-        # Color family
-        color_for_family = str(src_row.get("color", "")).strip()
-        if color_for_family and color_for_family.lower() not in ("", "nan"):
-            row_data["color_family"] = color_for_family.split("|")[0].strip()
+        # (Color Family assignment block removed entirely as requested)
 
         # Short description
         if short_descs and i < len(short_descs) and short_descs[i]:
