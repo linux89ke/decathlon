@@ -910,26 +910,27 @@ with st.sidebar:
         os.path.exists(p) for p in [MASTER_PATH, MASTER_PATH.replace(".xlsx", ".csv")]
     )
     if _bundled_exists:
-        st.success("✅ Master file loaded from system")
-        with st.expander("⬆️ Override with a different file"):
+        st.success("Master file loaded from system")
+        with st.expander("Override with a different file"):
             uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
     else:
         uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
 
     st.markdown("---")
-    if st.button("🗑️ Clear Cache & Reset", use_container_width=True,
-                 help="Clears all cached data (including pickle index) and resets the session."):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        # Delete pickles so both TF-IDF index and master data are rebuilt on next load
-        for pkl in [TFIDF_PICKLE_PATH, MASTER_PICKLE_PATH]:
-            try:
-                if os.path.exists(pkl):
-                    os.remove(pkl)
-            except Exception:
-                pass
+    # Keys that belong to working data (search results, overrides, AI output).
+    # Reference data caches (category/brand files, TF-IDF index) are intentionally
+    # left intact so they don't need to be reloaded on every reset.
+    _WORKING_STATE_KEYS = {
+        "run_id", "size_overrides", "cat_overrides",
+        "ai_categories", "short_descs", "combined",
+    }
+
+    if st.button("Clear Working Data", use_container_width=True,
+                 help="Resets search results and overrides. Category & brand files are kept loaded."):
+        # Only clear working session state — leave reference caches alone
         for key in list(st.session_state.keys()):
-            del st.session_state[key]
+            if key in _WORKING_STATE_KEYS or key.startswith(("size_fix_", "prim_", "cat_search")):
+                del st.session_state[key]
         st.rerun()
 
     st.markdown("---")
@@ -1057,7 +1058,7 @@ def search(q: str) -> pd.DataFrame:
 # INPUT TABS
 # =============================================================================
 
-tab1, tab2, tab3 = st.tabs(["Upload a List", "Manual Entry", "🗂️ Explore Categories"])
+tab1, tab2, tab3 = st.tabs(["Upload a List", "Manual Entry", "Explore Categories"])
 queries = []
 
 with tab1:
@@ -1084,61 +1085,152 @@ with tab2:
         height=160,
         placeholder="4273417\n4273418\n4273423",
     )
-    if manual.strip():
-        queries = [q.strip() for q in manual.strip().splitlines() if q.strip()]
+    manual_submitted = st.button("Search SKUs", type="primary", use_container_width=True)
+    if manual_submitted and manual.strip():
+        st.session_state["manual_queries"] = [q.strip() for q in manual.strip().splitlines() if q.strip()]
+    if "manual_queries" in st.session_state and not manual_submitted:
+        queries = st.session_state["manual_queries"]
+    elif manual_submitted and manual.strip():
+        queries = st.session_state["manual_queries"]
 
 with tab3:
-    st.subheader("🗂️ Category Explorer")
+    st.subheader("Category Explorer")
     if df_cat is None:
         st.warning("deca_cat.xlsx not loaded — categories unavailable.")
     else:
-        # Search bar
-        cat_explore_search = st.text_input(
-            "Search categories",
-            placeholder="e.g. running, football, kids, hiking…",
-            key="cat_explore_search",
-        )
-
-        # Build a clean display dataframe
+        # Build a clean deduplicated display dataframe
         cat_display = df_cat[["Category Path", "export_category", "category_name"]].copy()
         cat_display.columns = ["Full Path", "Export Code", "Category Name"]
         cat_display = cat_display.drop_duplicates(subset=["Export Code"]).reset_index(drop=True)
 
-        if cat_explore_search.strip():
-            q_lower = cat_explore_search.strip().lower()
+        # Split path into level columns
+        path_parts = cat_display["Full Path"].str.split("/", expand=True)
+        n_levels = path_parts.shape[1]
+        path_parts.columns = [f"L{i+1}" for i in range(n_levels)]
+        cat_display = pd.concat([cat_display, path_parts], axis=1)
+
+        # ── Stats bar ────────────────────────────────────────────────────────
+        total_cats  = len(cat_display)
+        n_l1        = cat_display["L1"].nunique()
+        deepest     = cat_display["Full Path"].str.count("/").max() + 1
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Total categories", total_cats)
+        sc2.metric("Top-level groups", n_l1)
+        sc3.metric("Max depth", deepest)
+
+        st.markdown("---")
+
+        # ── View toggle ───────────────────────────────────────────────────────
+        view_mode = st.radio(
+            "View as",
+            ["Tree (drill-down)", "Flat table"],
+            horizontal=True,
+            key="cat_view_mode",
+        )
+
+        # ── Keyword search ────────────────────────────────────────────────────
+        cat_explore_search = st.text_input(
+            "Search categories",
+            placeholder="e.g. running, football, kids, hiking",
+            key="cat_explore_search",
+        )
+        q_lower = cat_explore_search.strip().lower()
+
+        # Apply keyword filter
+        if q_lower:
             mask = (
                 cat_display["Full Path"].str.lower().str.contains(q_lower, na=False) |
                 cat_display["Category Name"].str.lower().str.contains(q_lower, na=False) |
                 cat_display["Export Code"].str.lower().str.contains(q_lower, na=False)
             )
-            cat_display = cat_display[mask].reset_index(drop=True)
+            filtered = cat_display[mask].reset_index(drop=True)
+        else:
+            filtered = cat_display.copy()
 
-        st.caption(f"Showing **{len(cat_display)}** categor{'y' if len(cat_display)==1 else 'ies'}"
-                   + (f" matching '{cat_explore_search}'" if cat_explore_search.strip() else " (all)"))
-
-        # Split path into breadcrumb columns for easier reading
-        path_parts = cat_display["Full Path"].str.split("/", expand=True)
-        path_parts.columns = [f"L{i+1}" for i in range(path_parts.shape[1])]
-
-        display_df = pd.concat([path_parts, cat_display[["Export Code"]]], axis=1)
-
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            height=500,
-            column_config={
-                col: st.column_config.TextColumn(col, width="medium")
-                for col in display_df.columns
-            },
+        st.caption(
+            f"Showing **{len(filtered)}** / {total_cats} categor{'y' if len(filtered)==1 else 'ies'}"
+            + (f" matching '{cat_explore_search}'" if q_lower else "")
         )
 
+        # ── TREE VIEW ─────────────────────────────────────────────────────────
+        if view_mode == "Tree (drill-down)":
+            l1_options = sorted(filtered["L1"].dropna().unique().tolist())
+            if not l1_options:
+                st.info("No categories match your search.")
+            else:
+                selected_l1 = st.selectbox(
+                    "Top-level group (L1)",
+                    ["(all)"] + l1_options,
+                    key="cat_tree_l1",
+                )
+                sub = filtered if selected_l1 == "(all)" else filtered[filtered["L1"] == selected_l1]
+
+                if selected_l1 != "(all)" and "L2" in sub.columns:
+                    l2_options = sorted(sub["L2"].dropna().unique().tolist())
+                    selected_l2 = st.selectbox(
+                        "Sub-group (L2)",
+                        ["(all)"] + l2_options,
+                        key="cat_tree_l2",
+                    )
+                    if selected_l2 != "(all)":
+                        sub = sub[sub["L2"] == selected_l2]
+
+                        if "L3" in sub.columns:
+                            l3_options = sorted(sub["L3"].dropna().unique().tolist())
+                            if l3_options:
+                                selected_l3 = st.selectbox(
+                                    "Category (L3)",
+                                    ["(all)"] + l3_options,
+                                    key="cat_tree_l3",
+                                )
+                                if selected_l3 != "(all)":
+                                    sub = sub[sub["L3"] == selected_l3]
+
+                st.caption(f"{len(sub)} categor{'y' if len(sub)==1 else 'ies'} in selection")
+
+                # Show results as an expandable list grouped by L1 > L2
+                level_cols = [c for c in [f"L{i+1}" for i in range(n_levels)] if c in sub.columns]
+                for l1_val, grp_l1 in sub.groupby("L1", sort=True):
+                    with st.expander(f"{l1_val}  ({len(grp_l1)})", expanded=(len(l1_options) == 1 or bool(q_lower))):
+                        if "L2" in grp_l1.columns:
+                            for l2_val, grp_l2 in grp_l1.groupby("L2", sort=True, dropna=False):
+                                l2_label = str(l2_val) if pd.notna(l2_val) else "(no sub-group)"
+                                st.markdown(f"**{l2_label}** — {len(grp_l2)} item(s)")
+                                rows_md = []
+                                for _, r in grp_l2.iterrows():
+                                    deeper = " / ".join(
+                                        str(r[c]) for c in level_cols[2:]
+                                        if pd.notna(r.get(c)) and str(r.get(c)).strip()
+                                    )
+                                    label = deeper if deeper else r["Category Name"]
+                                    rows_md.append(f"- `{r['Export Code']}` &nbsp; {label}")
+                                st.markdown("\n".join(rows_md), unsafe_allow_html=True)
+                        else:
+                            rows_md = [f"- `{r['Export Code']}` &nbsp; {r['Category Name']}" for _, r in grp_l1.iterrows()]
+                            st.markdown("\n".join(rows_md), unsafe_allow_html=True)
+
+        # ── FLAT TABLE VIEW ───────────────────────────────────────────────────
+        else:
+            level_cols = [c for c in [f"L{i+1}" for i in range(n_levels)] if c in filtered.columns]
+            display_df = pd.concat([filtered[level_cols], filtered[["Export Code"]]], axis=1)
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                height=480,
+                column_config={
+                    col: st.column_config.TextColumn(col, width="medium")
+                    for col in display_df.columns
+                },
+            )
+
+        st.markdown("---")
         # Download full category list
         cat_out = io.BytesIO()
         with pd.ExcelWriter(cat_out, engine="openpyxl") as w:
-            cat_display.to_excel(w, index=False, sheet_name="Categories")
+            cat_display[["Full Path", "Export Code", "Category Name"]].to_excel(w, index=False, sheet_name="Categories")
         st.download_button(
-            "⬇️ Download full category list (.xlsx)",
+            "Download full category list (.xlsx)",
             data=cat_out.getvalue(),
             file_name="decathlon_categories.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1258,11 +1350,11 @@ if queries:
 
         if is_fashion:
             st.info(
-                "🎨 **Fashion mode** — rows highlighted in red have a size not found in sizes.txt. "
+                "**Fashion mode** — rows highlighted in red have a size not found in sizes.txt. "
                 "Use the dropdowns below to fix them before downloading."
             )
         else:
-            st.info("🔧 **Other mode** — variation is taken from the size column; '...' shown when empty.")
+            st.info("**Other mode** — variation is taken from the size column; '...' shown when empty.")
 
         # Build display columns matching export template
         def _export_name(row):
@@ -1307,7 +1399,7 @@ if queries:
             bad_rows = preview[~preview["_size_ok"]]
             if not bad_rows.empty:
                 st.markdown("---")
-                st.subheader(f"🔴 Fix Sizes — {len(bad_rows)} row(s) need attention")
+                st.subheader(f"Fix Sizes — {len(bad_rows)} row(s) need attention")
                 st.caption("Select the correct size for each flagged row. Changes apply to the downloaded template.")
 
                 for pos_idx, row in bad_rows.iterrows():
@@ -1338,10 +1430,10 @@ if queries:
                     elif pos_idx in st.session_state.size_overrides:
                         del st.session_state.size_overrides[pos_idx]
 
-                if st.button("♻️ Re-apply size fixes to preview"):
+                if st.button("Re-apply size fixes to preview"):
                     st.rerun()
             else:
-                st.success("✅ All sizes matched in sizes.txt")
+                st.success("All sizes matched in sizes.txt")
 
         # ── 7. Category editor ────────────────────────────────────────────────
         if df_cat is not None:
@@ -1488,7 +1580,7 @@ if queries:
                     valid_sizes=valid_sizes,
                     size_overrides=idx_overrides,
                 )
-                mode_icon = "🤖" if (use_ai_matching and ai_categories) else "🔑"
+                mode_icon = "AI" if (use_ai_matching and ai_categories) else "KW"
                 st.download_button(
                     f"{mode_icon} Download Filled Upload Template (.xlsx)",
                     data=tpl_bytes,
