@@ -28,12 +28,10 @@ except ImportError:
 
 st.set_page_config(page_title="Decathlon Product Lookup", page_icon="", layout="wide")
 
-# Clear caches on every fresh page load (browser refresh) so data is never stale.
-# We detect a fresh load by checking for a run_id in session_state:
-# a new session = no run_id = fresh browser load.
+# Track session runs without clearing caches — cached data (TF-IDF index,
+# reference data) is shared across sessions for fast first load.
+# Use the "Clear Cache & Reset" button in the sidebar for a manual flush.
 if "run_id" not in st.session_state:
-    st.cache_data.clear()
-    st.cache_resource.clear()
     st.session_state["run_id"] = 1
 st.markdown("""
 <style>
@@ -183,7 +181,7 @@ def _format_gtin(val) -> str:
 # DATA LOADING
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Loading category & brand reference data…")
 def load_reference_data(file_bytes: bytes):
     wb_bytes = io.BytesIO(file_bytes)
     df_cat = pd.read_excel(wb_bytes, sheet_name="category", dtype=str)
@@ -222,7 +220,7 @@ def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner="Loading master product data…")
 def load_master(file_bytes: bytes, is_csv: bool) -> pd.DataFrame:
     if is_csv:
         try:
@@ -243,7 +241,7 @@ def _path_to_doc(path: str) -> str:
     return " ".join(parts) + " " + " ".join(parts[-3:]) * 2
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner="Building category index (first load only)…")
 def build_tfidf_index(ref_bytes: bytes):
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -808,7 +806,15 @@ def build_template(
 
 with st.sidebar:
     st.header("Master Data")
-    uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
+    _bundled_exists = any(
+        os.path.exists(p) for p in [MASTER_PATH, MASTER_PATH.replace(".xlsx", ".csv")]
+    )
+    if _bundled_exists:
+        st.success("✅ Master file loaded from system")
+        with st.expander("⬆️ Override with a different file"):
+            uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
+    else:
+        uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
 
     st.markdown("---")
     if st.button("🗑️ Clear Cache & Reset", use_container_width=True,
