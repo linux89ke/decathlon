@@ -16,8 +16,8 @@ Fixes & improvements in this version:
  - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
  - MASTER MAPPING: Description pulls directly from the 'description' column.
  - SIZE/VARIATION STRICT: Fills either Size OR Variation exclusively based on mode. Color Family left empty.
- - FORCE COLUMNS: If Size/Variation headers are missing in the template, they are appended automatically.
  - CATEGORY FORMAT: Category now exports as "CODE - FULL PATH".
+ - AUTO-CREATE COLUMNS: If any required column (like Size or Variation) is completely missing from the template, the script physically creates it.
 """
 
 import os, io, re, json, asyncio
@@ -775,18 +775,6 @@ def build_template(
             norm_val = re.sub(r'[^a-z0-9]', '', str(val).lower())
             header_map[norm_val] = col_idx
 
-    # ── FORCE MISSING COLUMNS GUARANTEE ──
-    # If the template lacks the columns entirely, we explicitly create them at the end.
-    if "size" not in header_map:
-        new_col = ws.max_column + 1
-        ws.cell(row=1, column=new_col).value = "Size"
-        header_map["size"] = new_col
-        
-    if "variation" not in header_map:
-        new_col = ws.max_column + 1
-        ws.cell(row=1, column=new_col).value = "Variation"
-        header_map["variation"] = new_col
-
     hfont      = ws.cell(row=1, column=1).font
     data_font  = Font(name=hfont.name or "Calibri", size=hfont.size or 11)
     data_align = Alignment(vertical="center")
@@ -819,6 +807,9 @@ def build_template(
     # Brand match cache to avoid repeated lookups for the same brand string
     _brand_cache: dict = {}
 
+    # We track max columns dynamically in case we need to append missing columns
+    current_max_col = ws.max_column
+
     for i, (idx, src_row) in enumerate(results_df.iterrows()):
         row_idx  = i + 2
         row_data = {}
@@ -848,7 +839,7 @@ def build_template(
         if gtin:
             row_data["GTIN_Barcode"] = gtin
 
-        # Product name: append colour
+        # Product name: append colour only if colour not already anywhere in name
         product_name = str(src_row.get("product_name", "")).strip()
         color_raw    = str(src_row.get("color", "")).strip()
         color        = color_raw.split("|")[0].strip()
@@ -880,7 +871,7 @@ def build_template(
                 _brand_cache[brand_key] = match_brand(brand_key, df_brands)
             row_data["Brand"] = _brand_cache[brand_key]
 
-        # Category — formatted as CODE - FULL PATH
+        # Category — formatted strictly as CODE - FULL PATH
         if ai_categories and i < len(ai_categories):
             primary_code, secondary_code = ai_categories[i]
         elif _kw_cats:
@@ -910,11 +901,10 @@ def build_template(
             size_override=per_row_override,
         )
 
-        # Write directly to normalized keys — our fallback logic guarantees these exist now
         if is_fashion:
-            row_data["size"] = computed_var   
+            row_data["Size"] = computed_var   
         else:
-            row_data["variation"]  = computed_var   
+            row_data["Variation"] = computed_var   
 
         # Price_KES / Stock
         row_data["price"]     = "100000"
@@ -928,17 +918,26 @@ def build_template(
 
         flag_red = is_fashion and is_size_missing(computed_var, valid_sizes or [])
 
-        # Write cells to Excel
+        # ── AUTO-CREATE AND WRITE CELLS ──
         for tmpl_col, value in row_data.items():
             norm_tmpl_col = re.sub(r'[^a-z0-9]', '', str(tmpl_col).lower())
             
-            if norm_tmpl_col in header_map:
-                cell           = ws.cell(row=row_idx, column=header_map[norm_tmpl_col])
-                cell.value     = value
-                cell.font      = data_font
-                cell.alignment = data_align
-                if flag_red:
-                    cell.fill = RED_FILL
+            # If the column doesn't exist in the template, create it dynamically
+            if norm_tmpl_col not in header_map:
+                current_max_col += 1
+                header_cell = ws.cell(row=1, column=current_max_col)
+                header_cell.value = tmpl_col
+                header_cell.font = Font(bold=True) # Give the new header nice styling
+                header_map[norm_tmpl_col] = current_max_col
+            
+            cell           = ws.cell(row=row_idx, column=header_map[norm_tmpl_col])
+            cell.value     = value
+            cell.font      = data_font
+            cell.alignment = data_align
+            
+            # Highlight missing fashion sizes in red
+            if flag_red and tmpl_col in ("Size", "Variation"):
+                cell.fill = RED_FILL
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1417,11 +1416,11 @@ if queries:
 
         # Explicitly separate the column names so you know exactly which mode is active
         if is_fashion:
-            preview["Size_Export"] = preview["_variation"]
-            display_cols = ["sku_num_sku_r3", "_export_name", "color", "Size_Export", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
+            preview["Size"] = preview["_variation"]
+            display_cols = ["sku_num_sku_r3", "_export_name", "color", "Size", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
         else:
-            preview["Variation_Export"] = preview["_variation"]
-            display_cols = ["sku_num_sku_r3", "_export_name", "color", "Variation_Export", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
+            preview["Variation"] = preview["_variation"]
+            display_cols = ["sku_num_sku_r3", "_export_name", "color", "Variation", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
 
         show_cols = [c for c in display_cols if c in preview.columns]
 
@@ -1429,8 +1428,8 @@ if queries:
             "sku_num_sku_r3":   st.column_config.TextColumn("SKU",                width="small"),
             "_export_name":     st.column_config.TextColumn("Name (export)",      width="large"),
             "color":            st.column_config.TextColumn("Colour",             width="medium"),
-            "Size_Export":      st.column_config.TextColumn("Size (Export)",      width="medium"),
-            "Variation_Export": st.column_config.TextColumn("Variation (Export)", width="medium"),
+            "Size":             st.column_config.TextColumn("Size (Export)",      width="medium"),
+            "Variation":        st.column_config.TextColumn("Variation (Export)", width="medium"),
             "_primary_cat":     st.column_config.TextColumn("Primary Category",   width="large"),
             "brand_name":       st.column_config.TextColumn("Brand",              width="small"),
             "bar_code":         st.column_config.TextColumn("Barcode",            width="medium"),
