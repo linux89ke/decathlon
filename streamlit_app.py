@@ -28,12 +28,17 @@ import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill
+import concurrent.futures
 
 try:
-    from groq import AsyncGroq, Groq as SyncGroq
-    GROQ_AVAILABLE = True
+    from openai import AsyncOpenAI
+    OPENAI_AVAILABLE = True
 except ImportError:
-    GROQ_AVAILABLE = False
+    OPENAI_AVAILABLE = False
+
+ZUMA_BASE_URL      = "https://ai-gateway.zuma.jumia.com/v1"
+ZUMA_DEFAULT_MODEL = "gemini-2.5-pro"
+ZUMA_KEY_PREFIX    = "jvk_"
 
 st.set_page_config(page_title="Decathlon Product Lookup", page_icon="", layout="wide")
 
@@ -92,13 +97,12 @@ CATEGORY_MATCH_FIELDS = [
     "size", "keywords", "description", "business_weight", "product_name",
 ]
 
-GROQ_SYSTEM_CAT = """You are a product categorization expert for a sports retailer.
+ZUMA_SYSTEM_CAT = """You are a product categorization expert for a sports retailer in Africa.
 Given a product description and candidate category paths, pick the {top_n} best matches.
 Consider brand, product type, gender, sport, and age group.
 
 Respond with JSON only:
-{{
- "categories": [
+{{ "categories": [
   {{"category":"<full path>","score": 0.95}},
   ...
  ]
@@ -106,16 +110,33 @@ Respond with JSON only:
 
 Rules:
 - Return exactly {top_n} categories ordered by confidence descending
-- Only pick from the provided candidate list - never invent categories
+- Only pick from the provided candidate list — never invent categories
 - Scores are floats 0.0-1.0
 - JSON only, nothing else"""
 
-GROQ_SYSTEM_DESC = """You are a product copywriter for a sports retail marketplace.
-Given product details, write exactly 3 short bullet points (each max 15 words) that highlight
-the key features a buyer cares about. Focus on: sport/use-case, key benefit or material, target user.
-Do NOT start with "Our team" or "Our designers". Be specific — mention the product name or sport.
+ZUMA_SYSTEM_KEY_FEATURES = """You are a product copywriter for a sports retail marketplace in Africa.
+Given product details, write exactly 3 short bullet points for the Key Features section.
+Each bullet must:
+- Be max 15 words
+- Highlight one specific feature, material, technology, or performance benefit
+- Be factual and grounded in the product details provided
+Do NOT start bullets with "Our team", "Our designers", or "Introducing".
 Respond with JSON only:
-{{"bullets": ["bullet 1","bullet 2","bullet 3"]}}
+{"bullets": ["bullet 1", "bullet 2", "bullet 3"]}
+JSON only, nothing else."""
+
+ZUMA_SYSTEM_DESC_ENRICH = """You are a product copywriter for a sports retail marketplace in Africa.
+Given product details, write an enriched product description (2-3 sentences, max 80 words) that:
+- States clearly what the product is and its primary sport or activity
+- Highlights the most important material, technology, or performance feature
+- Mentions the target user (men, women, kids, unisex)
+Rules:
+- Plain English only — no marketing fluff
+- Do NOT start with "Our team", "Our designers", "Introducing", or "We present"
+- Be specific — mention product type and sport
+- Do NOT invent features not implied by the provided data
+Respond with JSON only:
+{"description": "your enriched description here"}
 JSON only, nothing else."""
 
 
@@ -587,10 +608,16 @@ async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_
         try:
             if task_type == "cat":
                 cand_list = "\n".join(f"- {c}" for c in candidates)
-                sys_msg   = GROQ_SYSTEM_CAT.format(top_n=top_n)
+                sys_msg   = ZUMA_SYSTEM_CAT.format(top_n=top_n)
                 user_msg  = f"Product: {query}\n\nCandidates:\n{cand_list}"
+            elif task_type == "desc":
+                sys_msg   = ZUMA_SYSTEM_KEY_FEATURES
+                user_msg  = f"Product details: {query}"
+            elif task_type == "enrich_desc":
+                sys_msg   = ZUMA_SYSTEM_DESC_ENRICH
+                user_msg  = f"Product details: {query}"
             else:
-                sys_msg   = GROQ_SYSTEM_DESC
+                sys_msg   = ZUMA_SYSTEM_KEY_FEATURES
                 user_msg  = f"Product details: {query}"
             resp = await client.chat.completions.create(
                 model=model,
@@ -607,7 +634,6 @@ async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_
         except Exception as e:
             return idx, {"error": str(e)}
 
-
 async def _parallel_tasks(items, client, model, sem, task_type):
     tasks = [
         _async_rerank(i, q, c, client, model, 2, sem, task_type)
@@ -616,13 +642,29 @@ async def _parallel_tasks(items, client, model, sem, task_type):
     raw = await asyncio.gather(*tasks)
     return [r for _, r in sorted(raw, key=lambda x: x[0])]
 
-
-def groq_batch(items, api_key, model, concurrency, task_type="cat"):
+def zuma_batch(items, api_key, model, concurrency, task_type="cat"):
+    """
+    Run async Zuma AI requests in a dedicated thread to avoid
+    Streamlit's 'event loop already running' conflict.
+    """
     async def _run():
-        client = AsyncGroq(api_key=api_key)
-        sem    = asyncio.Semaphore(concurrency)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=ZUMA_BASE_URL,
+        )
+        sem = asyncio.Semaphore(concurrency)
         return await _parallel_tasks(items, client, model, sem, task_type)
-    return asyncio.run(_run())
+
+    def _thread_target():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(_thread_target).result()
 
 
 def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
@@ -647,7 +689,7 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
     unique_queries  = [model_to_query[mc] for mc in model_order]
     candidates_list = tfidf_shortlist(unique_queries, leaves, vectorizer, matrix, shortlist_k)
     items           = list(zip(unique_queries, candidates_list))
-    raw_preds       = groq_batch(items, api_key, model, concurrency, task_type="cat")
+    raw_preds       = zuma_batch(items, api_key, model, concurrency, task_type="cat")
 
     model_to_cats: dict = {}
     for mc, data in zip(model_order, raw_preds):
@@ -664,7 +706,7 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
         else:
             q  = _build_query_string(row)
             c  = tfidf_shortlist([q], leaves, vectorizer, matrix, shortlist_k)[0]
-            rd = groq_batch([(q, c)], api_key, model, 1, task_type="cat")[0]
+            rd = zuma_batch([(q, c)], api_key, model, 1, task_type="cat")[0]
             cats      = rd.get("categories", [])
             primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
             secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
@@ -698,7 +740,7 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
 
     unique_models = list(model_queries.keys())
     items         = [(model_queries[mc], []) for mc in unique_models]
-    raw_results   = groq_batch(items, api_key, model, concurrency, task_type="desc")
+    raw_results   = zuma_batch(items, api_key, model, concurrency, task_type="desc")
 
     model_to_desc: dict = {}
     for mc, data in zip(unique_models, raw_results):
@@ -718,6 +760,42 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
         else:
             descs.append(rule_based_short_desc(row))
     return descs
+
+def ai_enrich_descriptions(rows_df, api_key, model, concurrency=10):
+    """
+    Generate enriched product descriptions via Zuma AI.
+    Batched per model_code to minimise API calls.
+    Falls back to the original master description on any error.
+    """
+    model_queries: dict = {}
+    model_repr:    dict = {}
+    for i, (_, row) in enumerate(rows_df.iterrows()):
+        mc = str(row.get("model_code", "")).strip()
+        if mc and mc not in model_queries:
+            group = rows_df[rows_df["model_code"] == mc]
+            model_queries[mc] = _build_desc_query_per_model(group)
+            model_repr[mc]    = i
+
+    unique_models = list(model_queries.keys())
+    items         = [(model_queries[mc], []) for mc in unique_models]
+    raw_results   = zuma_batch(items, api_key, model, concurrency, task_type="enrich_desc")
+
+    model_to_desc: dict = {}
+    for mc, data in zip(unique_models, raw_results):
+        if "error" in data or "description" not in data:
+            fallback_row = rows_df.iloc[model_repr[mc]]
+            model_to_desc[mc] = _clean(fallback_row.get("description", ""))
+        else:
+            model_to_desc[mc] = data["description"]
+
+    enriched = []
+    for _, row in rows_df.iterrows():
+        mc = str(row.get("model_code", "")).strip()
+        if mc and mc in model_to_desc:
+            enriched.append(model_to_desc[mc])
+        else:
+            enriched.append(_clean(row.get("description", "")))
+    return enriched
 
 
 # =============================================================================
@@ -755,6 +833,7 @@ def build_template(
     df_brands,
     ai_categories,
     short_descs,
+    enriched_descs=None,
     is_fashion: bool = True,
     valid_sizes: Optional[list] = None,
     size_overrides: Optional[dict] = None,   # dict keyed by df index -> size string
@@ -843,6 +922,10 @@ def build_template(
             val = src_row.get(master_col, "")
             if pd.notna(val) and str(val).strip() not in ("", "nan"):
                 row_data[tmpl_col] = str(val).strip()
+
+        # Enriched description (AI-generated) overrides master description
+        if enriched_descs and i < len(enriched_descs) and enriched_descs[i]:
+            row_data["Description"] = enriched_descs[i]
 
         # Images: collect all non-empty URLs from IMAGE_COLS in order
         img_urls = [
@@ -1000,46 +1083,69 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.header("Category Matching")
-    use_ai_matching = st.toggle(
-        "AI matching (Groq)",
-        value=False,
-        help="OFF = fast keyword/TF-IDF. ON = TF-IDF shortlist + Groq LLM rerank.",
-    )
-
-    if use_ai_matching:
-        if not GROQ_AVAILABLE:
-            st.error("Install groq: `pip install groq`")
-            use_ai_matching = False
-        else:
-            st.markdown('<span class="ai-badge">AI MODE ON</span>', unsafe_allow_html=True)
-            show_key     = st.checkbox("Show key while typing", value=False)
-            groq_api_key = st.text_input(
-                "Groq API key",
-                type="default" if show_key else "password",
-                value=os.environ.get("GROQ_API_KEY", ""),
-                placeholder="Paste your gsk_... key here",
+    st.header("Zuma AI Settings")
+    if not OPENAI_AVAILABLE:
+        st.error("Install openai SDK: `pip install openai`")
+        use_ai_matching    = False
+        zuma_api_key       = ""
+        zuma_model         = ZUMA_DEFAULT_MODEL
+        concurrency        = 10
+        shortlist_k        = 30
+        ai_key_features    = False
+        ai_enrich_desc     = False
+    else:
+        use_ai_matching = st.toggle(
+            "Enable Zuma AI",
+            value=False,
+            help="OFF = fast keyword/TF-IDF only. ON = TF-IDF shortlist + Gemini rerank + content generation.",
+        )
+        if use_ai_matching:
+            st.markdown(
+                '<span class="ai-badge">ZUMA AI ON · Gemini 2.5 Pro</span>',
+                unsafe_allow_html=True,
             )
-            if groq_api_key and not groq_api_key.startswith("gsk_"):
-                st.warning("Groq keys usually start with `gsk_` — double-check.")
-            st.caption("Free key at [console.groq.com](https://console.groq.com)")
-            groq_model  = st.selectbox(
+            show_key = st.checkbox("Show key while typing", value=False)
+            zuma_api_key = st.text_input(
+                "Zuma AI key",
+                type="default" if show_key else "password",
+                value=os.environ.get("ZUMA_API_KEY", ""),
+                placeholder="jvk_...",
+            )
+            if zuma_api_key and not zuma_api_key.startswith(ZUMA_KEY_PREFIX):
+                st.warning(f"Zuma keys usually start with `{ZUMA_KEY_PREFIX}` — double-check.")
+
+            zuma_model = st.selectbox(
                 "Model",
-                ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
+                ["gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-pro"],
                 index=0,
             )
-            shortlist_k  = st.slider("Shortlist size", 10, 50, 30)
-            concurrency  = st.slider("Parallel Groq requests", 1, 30, 10)
+            shortlist_k = st.slider("TF-IDF shortlist size", 10, 50, 30)
+            concurrency = st.slider("Parallel requests", 1, 20, 10)
             st.markdown("---")
-            ai_short_desc = st.toggle("AI short descriptions (Groq)", value=True)
-    else:
-        st.markdown('<span class="kw-badge">KEYWORD MODE</span>', unsafe_allow_html=True)
-        st.caption("Instant vectorised TF-IDF keyword matching. No API key needed.")
-        groq_api_key  = ""
-        groq_model    = "llama-3.1-8b-instant"
-        shortlist_k   = 30
-        concurrency   = 10
-        ai_short_desc = False
+            st.caption("**Content Generation**")
+            ai_key_features = st.toggle(
+                "Generate Key Features",
+                value=True,
+                help="Writes 3 structured bullet points for the short_description field.",
+            )
+
+            ai_enrich_desc = st.toggle(
+                "Enrich Description",
+                value=True,
+                help="Rewrites the Description field with clear, factual product copy.",
+            )
+        else:
+            st.markdown(
+                '<span class="kw-badge">KEYWORD MODE</span>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Instant vectorised TF-IDF matching. No API key needed.")
+            zuma_api_key    = ""
+            zuma_model      = ZUMA_DEFAULT_MODEL
+            shortlist_k     = 30
+            concurrency     = 10
+            ai_key_features = False
+            ai_enrich_desc  = False
 
     st.markdown("---")
     st.header("Product Type")
@@ -1332,7 +1438,7 @@ if queries:
         # ── 1. Category matching ──────────────────────────────────────────────
         ai_categories = None
 
-        if df_cat is not None and use_ai_matching and groq_api_key:
+        if df_cat is not None and use_ai_matching and zuma_api_key:
             n               = len(combined)
             unique_models_n = combined["model_code"].nunique() if "model_code" in combined.columns else n
             est             = max(2, unique_models_n // concurrency + 2)
@@ -1340,26 +1446,39 @@ if queries:
                 try:
                     ai_categories, _model_cats = ai_match_categories(
                         combined, leaves, vectorizer, tfidf_matrix, path_to_export,
-                        groq_api_key, groq_model, shortlist_k, concurrency,
+                        zuma_api_key, zuma_model, shortlist_k, concurrency,
                     )
                     st.success(f"AI matched {unique_models_n} models → {n} SKUs")
                 except Exception as e:
-                    st.error(f"Groq category error: {e}")
+                    st.error(f"Zuma category error: {e}")
                     use_ai_matching = False
-        elif df_cat is not None and use_ai_matching and not groq_api_key:
-            st.warning("Enter your Groq API key in the sidebar to use AI matching.")
+        elif df_cat is not None and use_ai_matching and not zuma_api_key:
+            st.warning("Enter your Zuma API key in the sidebar to use AI matching.")
             use_ai_matching = False
 
-        # ── 2. Short descriptions ─────────────────────────────────────────────
-        short_descs = None
-
-        if use_ai_matching and ai_short_desc and groq_api_key:
-            with st.spinner(f"Generating AI short descriptions ({len(combined)} products)…"):
+        # ── 2a. Enrich Descriptions ───────────────────────────────────────────
+        enriched_descs = None
+        if use_ai_matching and ai_enrich_desc and zuma_api_key:
+            unique_models_n = combined["model_code"].nunique() if "model_code" in combined.columns else len(combined)
+            with st.spinner(f"Enriching descriptions for {unique_models_n} models…"):
                 try:
-                    short_descs = ai_short_descriptions(combined, groq_api_key, groq_model, concurrency)
-                    st.success("Short descriptions generated")
+                    enriched_descs = ai_enrich_descriptions(
+                        combined, zuma_api_key, zuma_model, concurrency
+                    )
+                    st.success(f"Descriptions enriched for {unique_models_n} models")
                 except Exception as e:
-                    st.error(f"Short desc error: {e}")
+                    st.error(f"Description enrichment error: {e}")
+                    enriched_descs = None
+
+        # ── 2b. Key Features (short_description) ─────────────────────────────
+        short_descs = None
+        if use_ai_matching and ai_key_features and zuma_api_key:
+            with st.spinner(f"Generating Key Features ({len(combined)} products)…"):
+                try:
+                    short_descs = ai_short_descriptions(combined, zuma_api_key, zuma_model, concurrency)
+                    st.success("Key Features generated")
+                except Exception as e:
+                    st.error(f"Key Features error: {e}")
                     short_descs = None
 
         if short_descs is None:
@@ -1650,6 +1769,7 @@ if queries:
                     df_brands,
                     ai_categories=merged_cats,
                     short_descs=short_descs,
+                    enriched_descs=enriched_descs,
                     is_fashion=is_fashion,
                     valid_sizes=valid_sizes,
                     size_overrides=idx_overrides,
