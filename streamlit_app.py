@@ -412,7 +412,6 @@ def keyword_match_category(row: pd.Series, df_cat: pd.DataFrame) -> tuple:
 
 # =============================================================================
 # VARIATION
-# FIX: "Other" mode reads from 'size' column (same as master), dots only if empty
 # =============================================================================
 
 def get_variation(
@@ -739,8 +738,6 @@ def match_brand(raw: str, df_brands: pd.DataFrame) -> str:
 
 # =============================================================================
 # TEMPLATE BUILDER
-# FIX: only writes Upload Template sheet; Price_KES = 100,000; Stock = 0
-# FIX: colour check uses 'in' not endswith; red fill for missing sizes
 # =============================================================================
 
 RED_FILL = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
@@ -834,7 +831,6 @@ def build_template(
             row_data["GTIN_Barcode"] = gtin
 
         # Product name: append colour only if colour not already anywhere in name
-        # FIX: was endswith, now checks full name for colour substring
         product_name = str(src_row.get("product_name", "")).strip()
         color_raw    = str(src_row.get("color", "")).strip()
         color        = color_raw.split("|")[0].strip()
@@ -891,10 +887,15 @@ def build_template(
             valid_sizes=valid_sizes,
             size_override=per_row_override,
         )
+        
+        # Dynamically find the exact column header in your Excel template (case-insensitive)
+        size_header = next((h for h in header_map if str(h).lower() == "size"), "size")
+        var_header  = next((h for h in header_map if str(h).lower() == "variation"), "variation")
+
         if is_fashion:
-            row_data["size"]      = computed_var
+            row_data[size_header] = computed_var
         else:
-            row_data["variation"] = computed_var
+            row_data[var_header]  = computed_var
 
         # Price_KES: always 100,000
         row_data["price"]     = "100000"
