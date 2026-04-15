@@ -16,9 +16,10 @@ Fixes & improvements in this version:
  - BULLETPROOF HEADERS: Export mapping completely ignores spaces, underscores, and capitalization.
  - MASTER MAPPING: Description pulls directly from the 'description' column.
  - SIZE/VARIATION STRICT: Physically deletes the unused column from the template file so they never co-exist.
- - CATEGORY FORMAT: Category now exports as "CODE - FULL PATH".
+ - CATEGORY FORMAT: export_category already contains "CODE - Name"; no double-formatting.
  - AUTO-CREATE COLUMNS: If any required column is completely missing from the template, the script physically creates it.
  - DUPLICATE COLUMNS FIXED: Removed redundant price/stock assignments.
+ - CATEGORY BUG FIX: _resolve() output is used directly as PrimaryCategory — no extra path lookup.
 """
 
 import os, io, re, json, asyncio
@@ -42,9 +43,6 @@ ZUMA_KEY_PREFIX    = "jvk_"
 
 st.set_page_config(page_title="Decathlon Product Lookup", page_icon="", layout="wide")
 
-# Track session runs without clearing caches — cached data (TF-IDF index,
-# reference data) is shared across sessions for fast first load.
-# Use the "Clear Cache & Reset" button in the sidebar for a manual flush.
 if "run_id" not in st.session_state:
     st.session_state["run_id"] = 1
 st.markdown("""
@@ -79,13 +77,12 @@ SIZES_PATH    = "sizes.txt"
 
 MASTER_TO_TEMPLATE = {
     "product_name":    "Name",
-    "description":     "Description",  
+    "description":     "Description",
     "sku_num_sku_r3":  "SellerSKU",
     "brand_name":      "Brand",
     "bar_code":        "GTIN_Barcode",
     "color":           "color",
     "model_label":     "model",
-    # Images are handled dynamically in build_template to skip blanks
 }
 
 # Template image slot names in order
@@ -141,13 +138,11 @@ JSON only, nothing else."""
 
 
 # =============================================================================
-# UK SIZE EXTRACTION — fixed to capture full range e.g. "UK 20-22"
+# UK SIZE EXTRACTION
 # =============================================================================
 
 _UK_SIZE_PATTERNS = [
-    # Full range first: "UK 20-22", "UK 6-8"
     re.compile(r'\b(UK\s*\d{1,2}(?:\.\d)?\s*[-–]\s*\d{1,2})\b', re.IGNORECASE),
-    # Single number: "UK 10", "UK 29"
     re.compile(r'\b(UK\s*\d{1,2}(?:\.\d)?)\b', re.IGNORECASE),
 ]
 
@@ -158,22 +153,18 @@ _CHILDREN_AGE_PATTERN = re.compile(
 
 
 def extract_uk_size(raw: str) -> Optional[str]:
-    """Extract a clean UK size label from a messy size string.
-    Returns full range if present (e.g. 'UK 20-22'), else single value."""
     if not raw:
         return None
     cleaned = re.sub(r'"+', '', raw).strip()
     for pat in _UK_SIZE_PATTERNS:
         m = pat.search(cleaned)
         if m:
-            # Normalise spacing: ensure "UK " prefix
             val = re.sub(r'^(UK)\s*', 'UK ', m.group(1), flags=re.IGNORECASE)
             return val.strip()
     return None
 
 
 def parse_valid_sizes(path: str) -> list:
-    """Load sizes.txt — one size per line, skip blanks/comments."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
@@ -193,7 +184,6 @@ def _clean(val) -> str:
 
 
 def _format_gtin(val) -> str:
-    """Convert scientific notation barcodes to full integer string."""
     raw = str(val).strip()
     if not raw or raw.lower() in ("nan", ""):
         return ""
@@ -230,17 +220,15 @@ def load_reference_data(file_bytes: bytes):
     return df_cat, df_brands
 
 
-# Alternate column names that should be treated as the SKU column
 _SKU_ALIASES = {"seller sku", "sellersku", "seller_sku", "sku", "sku_num_sku_r3"}
 
 
 def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename alternate SKU column names to the canonical 'sku_num_sku_r3'."""
     rename = {}
     for col in df.columns:
         if col.lower().replace(" ", "_") in _SKU_ALIASES and col != "sku_num_sku_r3":
             rename[col] = "sku_num_sku_r3"
-            break  # only rename the first match to avoid duplicates
+            break
     if rename:
         df = df.rename(columns=rename)
     return df
@@ -250,7 +238,6 @@ MASTER_PICKLE_PATH = "master_data.pkl"
 
 
 def _master_mtime() -> float:
-    """Return modification time of the bundled master file, or 0 if missing."""
     for path in [MASTER_PATH, MASTER_PATH.replace(".xlsx", ".csv")]:
         try:
             return os.path.getmtime(path)
@@ -272,16 +259,10 @@ def load_master(file_bytes: bytes, is_csv: bool) -> pd.DataFrame:
 
 
 def load_master_fast(is_uploaded: bool = False) -> pd.DataFrame:
-    """
-    Load the bundled master file using a pickle cache for speed.
-    Falls back to reading the xlsx/csv directly if pickle is missing or stale.
-    Only used for the bundled file — uploaded overrides always bypass this.
-    """
     import pickle
 
     mtime = _master_mtime()
 
-    # Try pickle first
     if os.path.exists(MASTER_PICKLE_PATH):
         try:
             with open(MASTER_PICKLE_PATH, "rb") as f:
@@ -289,9 +270,8 @@ def load_master_fast(is_uploaded: bool = False) -> pd.DataFrame:
             if cached.get("mtime") == mtime:
                 return cached["df"]
         except Exception:
-            pass  # corrupt pickle — rebuild below
+            pass
 
-    # Read from xlsx / csv
     df = None
     for path, csv in [(MASTER_PATH, False), (MASTER_PATH.replace(".xlsx", ".csv"), True)]:
         try:
@@ -304,7 +284,6 @@ def load_master_fast(is_uploaded: bool = False) -> pd.DataFrame:
     if df is None:
         return None
 
-    # Save pickle
     try:
         with open(MASTER_PICKLE_PATH, "wb") as f:
             pickle.dump({"mtime": mtime, "df": df}, f)
@@ -327,7 +306,6 @@ TFIDF_PICKLE_PATH = "tfidf_index.pkl"
 
 
 def _cat_mtime() -> float:
-    """Return deca_cat.xlsx modification time, or 0 if missing."""
     try:
         return os.path.getmtime(DECA_CAT_PATH)
     except OSError:
@@ -341,7 +319,6 @@ def build_tfidf_index(ref_bytes: bytes):
 
     mtime = _cat_mtime()
 
-    # ── Try loading from pickle ────────────────────────────────────────────
     if os.path.exists(TFIDF_PICKLE_PATH):
         try:
             with open(TFIDF_PICKLE_PATH, "rb") as f:
@@ -354,9 +331,8 @@ def build_tfidf_index(ref_bytes: bytes):
                     cached["path_to_export"],
                 )
         except Exception:
-            pass  # corrupt pickle — rebuild below
+            pass
 
-    # ── Build from scratch ─────────────────────────────────────────────
     df_cat, _ = load_reference_data(ref_bytes)
     all_paths = df_cat["Category Path"].dropna().astype(str).tolist()
     path_set  = set(all_paths)
@@ -367,7 +343,6 @@ def build_tfidf_index(ref_bytes: bytes):
     matrix    = vectorizer.fit_transform(docs)
     path_to_export = dict(zip(df_cat["Category Path"], df_cat["export_category"]))
 
-    # ── Save pickle ───────────────────────────────────────────────────
     try:
         with open(TFIDF_PICKLE_PATH, "wb") as f:
             pickle.dump({
@@ -378,7 +353,7 @@ def build_tfidf_index(ref_bytes: bytes):
                 "path_to_export": path_to_export,
             }, f)
     except Exception:
-        pass  # pickle save failure is non-fatal
+        pass
 
     return leaves, vectorizer, matrix, path_to_export
 
@@ -414,14 +389,13 @@ def keyword_match_batch(rows_df: pd.DataFrame, df_cat: pd.DataFrame) -> list:
     cat_names      = df_cat["category_name_lower"].tolist()
     cat_exports    = df_cat["export_category"].tolist()
     n_cats         = len(cat_exports)
-    depth_bonus    = cat_depths * 0.1  # precompute once
+    depth_bonus    = cat_depths * 0.1
     results = []
     for query in queries:
         if not query:
             results.append(("", ""))
             continue
         q_tokens = set(re.findall(r"[a-z]+", query))
-        # Vectorised token-overlap + name bonus + depth
         token_scores = np.array([len(q_tokens & s) for s in cat_token_sets], dtype=np.float32)
         name_bonus   = np.array([2.0 if n in query else 0.0 for n in cat_names], dtype=np.float32)
         scores       = token_scores + name_bonus + depth_bonus
@@ -447,14 +421,9 @@ def get_variation(
     valid_sizes: Optional[list] = None,
     size_override: Optional[str] = None,
 ) -> str:
-    """
-    Fashion  → 'size' column, UK extraction, sizes.txt validation
-    Other    → 'size' column directly; '...' only if empty/missing
-    """
     raw_size = re.sub(r'"+', '', str(row.get("size", ""))).strip().rstrip(".")
 
     if not is_fashion:
-        # Other: use size column as-is, fallback to variation col, dots if both empty
         if raw_size.lower() not in ("", "nan", "no size", "none"):
             return raw_size
         raw_var = re.sub(r'"+', '', str(row.get("variation", ""))).strip().rstrip(".")
@@ -462,47 +431,41 @@ def get_variation(
             return raw_var
         return "..."
 
-    # Fashion path
     if raw_size.lower() in ("", "nan", "no size", "none"):
         return size_override or "..."
 
     if size_override:
         return size_override
 
-    # Direct match against sizes.txt
     if valid_sizes:
         raw_upper = raw_size.upper()
         for s in valid_sizes:
             if s.upper() == raw_upper:
                 return s
 
-    # UK range/size extraction
     uk = extract_uk_size(raw_size)
     if uk and valid_sizes:
         uk_upper = uk.upper()
         for s in valid_sizes:
             if s.upper() == uk_upper:
                 return s
-        return uk  # extracted but not in list
+        return uk
 
-    # Partial match
     if valid_sizes:
         raw_lower = raw_size.lower()
         for s in valid_sizes:
             if s.lower() in raw_lower or raw_lower in s.lower():
                 return s
 
-    return raw_size  # best-effort fallback
+    return raw_size
 
 
 @st.cache_data
 def _valid_sizes_upper_set(sizes_tuple: tuple) -> frozenset:
-    """Build a frozen upper-case set from valid_sizes once and cache it."""
     return frozenset(s.upper() for s in sizes_tuple)
 
 
 def is_size_missing(computed_variation: str, valid_sizes: list) -> bool:
-    """Return True if the computed variation is not in sizes.txt (flags red row)."""
     if not valid_sizes:
         return False
     if computed_variation in ("...", ""):
@@ -567,7 +530,7 @@ def rule_based_short_desc(row: pd.Series) -> str:
     b1_parts = [p for p in [brand, sport, gender] if p]
     if b1_parts:
         bullets.append(" · ".join(b1_parts))
-    desc = _clean(row.get("description", ""))  
+    desc = _clean(row.get("description", ""))
     quality_phrases = _extract_quality_phrases(desc, max_phrases=2)
     if quality_phrases:
         bullets.append(" · ".join(quality_phrases))
@@ -643,10 +606,6 @@ async def _parallel_tasks(items, client, model, sem, task_type):
     return [r for _, r in sorted(raw, key=lambda x: x[0])]
 
 def zuma_batch(items, api_key, model, concurrency, task_type="cat"):
-    """
-    Run async Zuma AI requests in a dedicated thread to avoid
-    Streamlit's 'event loop already running' conflict.
-    """
     async def _run():
         client = AsyncOpenAI(
             api_key=api_key,
@@ -670,6 +629,7 @@ def zuma_batch(items, api_key, model, concurrency, task_type="cat"):
 def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
                          api_key, model, shortlist_k=30, concurrency=10):
     def _resolve(cat_path: str) -> str:
+        """Convert a Category Path returned by the AI into an export_category label."""
         if cat_path in path_to_export:
             return path_to_export[cat_path]
         for p, ex in path_to_export.items():
@@ -722,7 +682,7 @@ def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
         _clean(row.get("department_label", "")),
         _clean(row.get("brand_name", "")),
         _clean(row.get("channable_gender", "")).split("|")[0].strip(),
-        _clean(row.get("description", ""))[:300],  
+        _clean(row.get("description", ""))[:300],
         _clean(row.get("keywords", ""))[:100],
     ]
     return "|".join(p for p in parts if p)
@@ -762,11 +722,6 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
     return descs
 
 def ai_enrich_descriptions(rows_df, api_key, model, concurrency=10):
-    """
-    Generate enriched product descriptions via Zuma AI.
-    Batched per model_code to minimise API calls.
-    Falls back to the original master description on any error.
-    """
     model_queries: dict = {}
     model_repr:    dict = {}
     for i, (_, row) in enumerate(rows_df.iterrows()):
@@ -806,14 +761,12 @@ def match_brand(raw: str, df_brands: pd.DataFrame) -> str:
     if not raw or pd.isna(raw):
         return ""
     needle = str(raw).strip().lower()
-    # Build lookup dicts once per unique df_brands object using a cache keyed by id
     exact = df_brands[df_brands["brand_name_lower"] == needle]
     if not exact.empty:
         return exact.iloc[0]["brand_entry"]
     partial = df_brands[df_brands["brand_name_lower"].str.contains(needle, regex=False, na=False)]
     if not partial.empty:
         return partial.iloc[0]["brand_entry"]
-    # Check if any brand name is contained within the needle
     match = df_brands[df_brands["brand_name_lower"].apply(lambda b: b in needle)]
     if not match.empty:
         return match.iloc[0]["brand_entry"]
@@ -836,11 +789,10 @@ def build_template(
     enriched_descs=None,
     is_fashion: bool = True,
     valid_sizes: Optional[list] = None,
-    size_overrides: Optional[dict] = None,   # dict keyed by df index -> size string
+    size_overrides: Optional[dict] = None,
 ) -> bytes:
     wb = load_workbook(TEMPLATE_PATH)
 
-    # Keep only the Upload Template sheet
     sheets_to_remove = [s for s in wb.sheetnames if s != "Upload Template"]
     for s in sheets_to_remove:
         del wb[s]
@@ -856,12 +808,9 @@ def build_template(
             header_map[norm_val] = col_idx
 
     # ── STRICT SEPARATION: DELETE THE UNUSED COLUMN ──
-    # If the template file comes with BOTH columns pre-built, we physically delete the one we don't need.
     unused_col_key = "variation" if is_fashion else "size"
     if unused_col_key in header_map:
         ws.delete_cols(header_map[unused_col_key])
-        
-        # Re-build header map because deleting a column shifts all columns to the left!
         header_map = {}
         for col_idx in range(1, ws.max_column + 1):
             val = ws.cell(row=1, column=col_idx).value
@@ -870,15 +819,14 @@ def build_template(
                 header_map[norm_val] = col_idx
 
     # ── FORCE MISSING COLUMNS GUARANTEE ──
-    # If the template lacks the active column entirely, we explicitly create it at the end.
-    active_col_key = "size" if is_fashion else "variation"
+    active_col_key   = "size" if is_fashion else "variation"
     active_col_label = "Size" if is_fashion else "Variation"
-    
+
     if active_col_key not in header_map:
         new_col = ws.max_column + 1
         ws.cell(row=1, column=new_col).value = active_col_label
         header_map[active_col_key] = new_col
-        
+
     current_max_col = ws.max_column
 
     hfont      = ws.cell(row=1, column=1).font
@@ -893,24 +841,13 @@ def build_template(
         if mc and sku and mc not in model_to_first_sku:
             model_to_first_sku[mc] = sku
 
-    # export_code -> full Category Path
-    if df_cat is not None:
-        exp_to_fullpath: dict = {}
-        for _, _cr in df_cat.iterrows():
-            _exp = str(_cr.get("export_category", "")).strip()
-            _fp  = str(_cr.get("Category Path", "")).strip()
-            if _exp and _fp and _exp not in exp_to_fullpath:
-                exp_to_fullpath[_exp] = _fp
-    else:
-        exp_to_fullpath = {}
-
     # Pre-resolve keyword categories in one batch when no AI categories provided
     if not ai_categories and df_cat is not None:
         _kw_cats = keyword_match_batch(results_df, df_cat)
     else:
         _kw_cats = None
 
-    # Brand match cache to avoid repeated lookups for the same brand string
+    # Brand match cache
     _brand_cache: dict = {}
 
     for i, (idx, src_row) in enumerate(results_df.iterrows()):
@@ -923,11 +860,11 @@ def build_template(
             if pd.notna(val) and str(val).strip() not in ("", "nan"):
                 row_data[tmpl_col] = str(val).strip()
 
-        # Enriched description (AI-generated) overrides master description
+        # Enriched description overrides master description
         if enriched_descs and i < len(enriched_descs) and enriched_descs[i]:
             row_data["Description"] = enriched_descs[i]
 
-        # Images: collect all non-empty URLs from IMAGE_COLS in order
+        # Images: collect all non-empty URLs sequentially
         img_urls = [
             str(src_row[c]).strip()
             for c in IMAGE_COLS
@@ -946,7 +883,7 @@ def build_template(
         if gtin:
             row_data["GTIN_Barcode"] = gtin
 
-        # Product name: append colour only if colour not already anywhere in name
+        # Product name: append colour only if not already in name
         product_name = str(src_row.get("product_name", "")).strip()
         color_raw    = str(src_row.get("color", "")).strip()
         color        = color_raw.split("|")[0].strip()
@@ -964,7 +901,7 @@ def build_template(
         if bw and bw.lower() not in ("", "nan"):
             row_data["product_weight"] = re.sub(r'\s*kg\s*$', '', bw, flags=re.IGNORECASE).strip()
 
-        # package_content: "Name - Size"
+        # package_content
         size_val = re.sub(r'"+', '', str(src_row.get("size", ""))).strip().rstrip(".")
         if size_val.lower() not in ("", "nan", "no size"):
             pkg_name = row_data.get("Name", product_name)
@@ -978,26 +915,18 @@ def build_template(
                 _brand_cache[brand_key] = match_brand(brand_key, df_brands)
             row_data["Brand"] = _brand_cache[brand_key]
 
-        # Category — formatted strictly as CODE - FULL PATH
+        # ── CATEGORY — FIX: export_category already = "CODE - Name", use directly ──
         if ai_categories and i < len(ai_categories):
-            primary_code, secondary_code = ai_categories[i]
+            primary_cat, secondary_cat = ai_categories[i]
         elif _kw_cats:
-            primary_code, secondary_code = _kw_cats[i]
+            primary_cat, secondary_cat = _kw_cats[i]
         else:
-            primary_code, secondary_code = ("", "")
+            primary_cat, secondary_cat = ("", "")
 
-        primary_full   = exp_to_fullpath.get(primary_code, primary_code)
-        secondary_full = exp_to_fullpath.get(secondary_code, secondary_code)
-
-        if primary_code and primary_full:
-            row_data["PrimaryCategory"] = f"{primary_code} - {primary_full}" if primary_code != primary_full else primary_full
-        elif primary_full:
-            row_data["PrimaryCategory"] = primary_full
-            
-        if secondary_code and secondary_full:
-            row_data["AdditionalCategory"] = f"{secondary_code} - {secondary_full}" if secondary_code != secondary_full else secondary_full
-        elif secondary_full:
-            row_data["AdditionalCategory"] = secondary_full
+        if primary_cat:
+            row_data["PrimaryCategory"] = primary_cat      # e.g. "1000034 - Apparel & Accessories"
+        if secondary_cat:
+            row_data["AdditionalCategory"] = secondary_cat
 
         # Size/Variation
         per_row_override = (size_overrides or {}).get(idx)
@@ -1009,9 +938,9 @@ def build_template(
         )
 
         if is_fashion:
-            row_data["Size"] = computed_var   
+            row_data["Size"] = computed_var
         else:
-            row_data["Variation"] = computed_var   
+            row_data["Variation"] = computed_var
 
         # Price_KES / Stock
         row_data["Price_KES"] = "100000"
@@ -1023,24 +952,22 @@ def build_template(
 
         flag_red = is_fashion and is_size_missing(computed_var, valid_sizes or [])
 
-        # ── AUTO-CREATE AND WRITE CELLS ──
+        # ── WRITE CELLS ──
         for tmpl_col, value in row_data.items():
             norm_tmpl_col = re.sub(r'[^a-z0-9]', '', str(tmpl_col).lower())
-            
-            # If the column doesn't exist in the template, create it dynamically
+
             if norm_tmpl_col not in header_map:
                 current_max_col += 1
                 header_cell = ws.cell(row=1, column=current_max_col)
                 header_cell.value = tmpl_col
-                header_cell.font = Font(bold=True) # Give the new header nice styling
+                header_cell.font  = Font(bold=True)
                 header_map[norm_tmpl_col] = current_max_col
-            
+
             cell           = ws.cell(row=row_idx, column=header_map[norm_tmpl_col])
             cell.value     = value
             cell.font      = data_font
             cell.alignment = data_align
-            
-            # Highlight missing fashion sizes in red
+
             if flag_red and tmpl_col in ("Size", "Variation"):
                 cell.fill = RED_FILL
 
@@ -1066,9 +993,6 @@ with st.sidebar:
         uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
 
     st.markdown("---")
-    # Keys that belong to working data (search results, overrides, AI output).
-    # Reference data caches (category/brand files, TF-IDF index) are intentionally
-    # left intact so they don't need to be reloaded on every reset.
     _WORKING_STATE_KEYS = {
         "run_id", "size_overrides", "cat_overrides",
         "ai_categories", "short_descs", "combined",
@@ -1076,7 +1000,6 @@ with st.sidebar:
 
     if st.button("Clear Working Data", use_container_width=True,
                  help="Resets search results and overrides. Category & brand files are kept loaded."):
-        # Only clear working session state — leave reference caches alone
         for key in list(st.session_state.keys()):
             if key in _WORKING_STATE_KEYS or key.startswith(("size_fix_", "prim_", "cat_search")):
                 del st.session_state[key]
@@ -1128,7 +1051,6 @@ with st.sidebar:
                 value=True,
                 help="Writes 3 structured bullet points for the short_description field.",
             )
-
             ai_enrich_desc = st.toggle(
                 "Enrich Description",
                 value=True,
@@ -1161,7 +1083,6 @@ with st.sidebar:
     )
     is_fashion = product_type == "Fashion"
 
-    # Load valid sizes from project folder automatically
     valid_sizes: list = parse_valid_sizes(SIZES_PATH)
     if valid_sizes:
         st.sidebar.info(f"sizes.txt loaded: {len(valid_sizes)} sizes")
@@ -1197,13 +1118,11 @@ else:
 # =============================================================================
 
 if uploaded_master:
-    # User has explicitly uploaded a file — read it directly (no pickle)
     master_bytes = uploaded_master.read()
     is_csv       = uploaded_master.name.endswith(".csv")
     df_master    = load_master(master_bytes, is_csv)
     st.sidebar.success(f"{len(df_master):,} product rows loaded")
 else:
-    # Use pickle-backed fast loader for the bundled master file
     df_master = load_master_fast()
     if df_master is None:
         st.error(f"Master file not found. Place '{MASTER_PATH}' in the same folder as app.py.")
@@ -1270,18 +1189,15 @@ with tab3:
     if df_cat is None:
         st.warning("deca_cat.xlsx not loaded — categories unavailable.")
     else:
-        # Build a clean deduplicated display dataframe
         cat_display = df_cat[["Category Path", "export_category", "category_name"]].copy()
         cat_display.columns = ["Full Path", "Export Code", "Category Name"]
         cat_display = cat_display.drop_duplicates(subset=["Export Code"]).reset_index(drop=True)
 
-        # Split path into level columns
         path_parts = cat_display["Full Path"].str.split("/", expand=True)
         n_levels = path_parts.shape[1]
         path_parts.columns = [f"L{i+1}" for i in range(n_levels)]
         cat_display = pd.concat([cat_display, path_parts], axis=1)
 
-        # ── Stats bar ────────────────────────────────────────────────────────
         total_cats  = len(cat_display)
         n_l1        = cat_display["L1"].nunique()
         deepest     = cat_display["Full Path"].str.count("/").max() + 1
@@ -1292,7 +1208,6 @@ with tab3:
 
         st.markdown("---")
 
-        # ── View toggle ───────────────────────────────────────────────────────
         view_mode = st.radio(
             "View as",
             ["Tree (drill-down)", "Flat table"],
@@ -1300,7 +1215,6 @@ with tab3:
             key="cat_view_mode",
         )
 
-        # ── Keyword search ────────────────────────────────────────────────────
         cat_explore_search = st.text_input(
             "Search categories",
             placeholder="e.g. running, football, kids, hiking",
@@ -1308,7 +1222,6 @@ with tab3:
         )
         q_lower = cat_explore_search.strip().lower()
 
-        # Apply keyword filter
         if q_lower:
             mask = (
                 cat_display["Full Path"].str.lower().str.contains(q_lower, na=False) |
@@ -1324,7 +1237,6 @@ with tab3:
             + (f" matching '{cat_explore_search}'" if q_lower else "")
         )
 
-        # ── TREE VIEW ─────────────────────────────────────────────────────────
         if view_mode == "Tree (drill-down)":
             l1_options = sorted(filtered["L1"].dropna().unique().tolist())
             if not l1_options:
@@ -1360,7 +1272,6 @@ with tab3:
 
                 st.caption(f"{len(sub)} categor{'y' if len(sub)==1 else 'ies'} in selection")
 
-                # Show results as an expandable list grouped by L1 > L2
                 level_cols = [c for c in [f"L{i+1}" for i in range(n_levels)] if c in sub.columns]
                 for l1_val, grp_l1 in sub.groupby("L1", sort=True):
                     with st.expander(f"{l1_val}  ({len(grp_l1)})", expanded=(len(l1_options) == 1 or bool(q_lower))):
@@ -1380,8 +1291,6 @@ with tab3:
                         else:
                             rows_md = [f"- `{r['Export Code']}` &nbsp; {r['Category Name']}" for _, r in grp_l1.iterrows()]
                             st.markdown("\n".join(rows_md), unsafe_allow_html=True)
-
-        # ── FLAT TABLE VIEW ───────────────────────────────────────────────────
         else:
             level_cols = [c for c in [f"L{i+1}" for i in range(n_levels)] if c in filtered.columns]
             display_df = pd.concat([filtered[level_cols], filtered[["Export Code"]]], axis=1)
@@ -1397,7 +1306,6 @@ with tab3:
             )
 
         st.markdown("---")
-        # Download full category list
         cat_out = io.BytesIO()
         with pd.ExcelWriter(cat_out, engine="openpyxl") as w:
             cat_display[["Full Path", "Export Code", "Category Name"]].to_excel(w, index=False, sheet_name="Categories")
@@ -1470,7 +1378,7 @@ if queries:
                     st.error(f"Description enrichment error: {e}")
                     enriched_descs = None
 
-        # ── 2b. Key Features (short_description) ─────────────────────────────
+        # ── 2b. Key Features ─────────────────────────────────────────────────
         short_descs = None
         if use_ai_matching and ai_key_features and zuma_api_key:
             with st.spinner(f"Generating Key Features ({len(combined)} products)…"):
@@ -1484,24 +1392,10 @@ if queries:
         if short_descs is None:
             short_descs = [rule_based_short_desc(row) for _, row in combined.iterrows()]
 
-        # ── 3. Category path lookup ───────────────────────────────────────────
-        if df_cat is not None:
-            _exp_to_path: dict = {}
-            for _, _rc in df_cat.iterrows():
-                _e = str(_rc.get("export_category", "")).strip()
-                _p = str(_rc.get("Category Path", "")).strip()
-                if _e and _p and _e not in _exp_to_path:
-                    _exp_to_path[_e] = _p
-        else:
-            _exp_to_path = {}
-
-        # Formats the preview category to explicitly show "CODE - PATH"
+        # ── 3. Preview category helper ────────────────────────────────────────
+        # export_category already = "CODE - Name", use directly — no path lookup needed
         def _code_to_full(code):
-            c = str(code).strip()
-            if not c:
-                return ""
-            p = _exp_to_path.get(c, c)
-            return f"{c} - {p}" if c != p else p
+            return str(code).strip()
 
         # ── 4. Compute auto variations & categories for preview ───────────────
         if "size_overrides" not in st.session_state:
@@ -1518,7 +1412,6 @@ if queries:
         else:
             preview["_primary_cat"] = ""
 
-        # Compute variation using per-row overrides
         def _compute_var(row):
             override = st.session_state.size_overrides.get(row.name)
             return get_variation(
@@ -1533,7 +1426,7 @@ if queries:
             lambda v: not is_size_missing(v, valid_sizes) if is_fashion else True
         )
 
-        # ── 5. Preview table — final export look ──────────────────────────────
+        # ── 5. Preview table ──────────────────────────────────────────────────
         st.markdown("---")
         st.subheader(f"Export Preview — {total_rows} SKU(s)")
 
@@ -1545,17 +1438,15 @@ if queries:
         else:
             st.info("**Other mode** — variation is taken from the size column; '...' shown when empty.")
 
-        # Build display columns matching export template
         def _export_name(row):
-            pn    = str(row.get("product_name", "")).strip()
-            col   = str(row.get("color", "")).split("|")[0].strip()
+            pn  = str(row.get("product_name", "")).strip()
+            col = str(row.get("color", "")).split("|")[0].strip()
             if pn and col and col.lower() not in pn.lower():
                 return f"{pn} - {col.title()}"
             return pn
 
         preview["_export_name"] = preview.apply(_export_name, axis=1)
 
-        # Explicitly separate the column names so you know exactly which mode is active
         if is_fashion:
             preview["Size"] = preview["_variation"]
             display_cols = ["sku_num_sku_r3", "_export_name", "color", "Size", "_primary_cat", "brand_name", "bar_code", "_size_ok"]
@@ -1587,7 +1478,7 @@ if queries:
         st.dataframe(df_display, use_container_width=True, hide_index=True, height=420,
                      column_config=col_cfg)
 
-        # ── 6. Per-row size fix (fashion only) ────────────────────────────────
+        # ── 6. Per-row size fix ───────────────────────────────────────────────
         if is_fashion and valid_sizes:
             bad_rows = preview[~preview["_size_ok"]]
             if not bad_rows.empty:
@@ -1638,25 +1529,9 @@ if queries:
                 "Edit one row per model — siblings update automatically on export."
             )
 
-            export_to_path: dict = {}
-            for _, row_c in df_cat.iterrows():
-                exp  = str(row_c.get("export_category", "")).strip()
-                path = str(row_c.get("Category Path", "")).strip()
-                if exp and path and exp not in export_to_path:
-                    export_to_path[exp] = path
-            path_label_to_export: dict = {v: k for k, v in export_to_path.items()}
-
-            def export_to_label(code: str) -> str:
-                if not code:
-                    return ""
-                return export_to_path.get(code, code)
-
-            def label_to_export(label: str) -> str:
-                if not label or label == "(auto)":
-                    return ""
-                return path_label_to_export.get(label, label)
-
-            all_path_labels    = sorted(export_to_path.values())
+            # export_category is already "CODE - Name" — use as-is for path labels
+            all_export_cats = df_cat["export_category"].dropna().unique().tolist()
+            all_path_labels = sorted(all_export_cats)
             all_labels_w_blank = ["(auto)"] + all_path_labels
 
             if "cat_overrides" not in st.session_state:
@@ -1699,13 +1574,12 @@ if queries:
                         j for j, (_, r) in enumerate(combined.iterrows())
                         if str(r.get("model_code", "")).strip() == mc
                     )
-                    auto_prim_code, _ = ai_categories[first_idx]
+                    auto_prim, _ = ai_categories[first_idx]
                 else:
-                    auto_prim_code, _ = keyword_match_category(prow, df_cat)
+                    auto_prim, _ = keyword_match_category(prow, df_cat)
 
-                auto_prim_label = export_to_label(auto_prim_code)
-                override        = st.session_state.cat_overrides.get(mc, {})
-                cur_prim_label  = export_to_label(override.get("primary", auto_prim_code)) or auto_prim_label
+                override       = st.session_state.cat_overrides.get(mc, {})
+                cur_prim_label = override.get("primary", auto_prim) or auto_prim
 
                 c1, c2, c4 = st.columns([2, 5, 1])
                 c1.markdown(f"**{mc}** \n{name} \n`{sku_count} SKU(s)`")
@@ -1717,14 +1591,13 @@ if queries:
                 try:    prim_idx = prim_opts.index(cur_prim_label)
                 except ValueError: prim_idx = 0
 
-                new_prim_label = c2.selectbox(
+                new_prim = c2.selectbox(
                     f"Primary #{mc}", prim_opts,
                     index=prim_idx, label_visibility="collapsed", key=f"prim_{mc}",
                 )
-                new_prim_code = label_to_export(new_prim_label) if new_prim_label != "(auto)" else auto_prim_code
 
-                if new_prim_label != "(auto)":
-                    st.session_state.cat_overrides[mc] = {"primary": new_prim_code, "additional": ""}
+                if new_prim != "(auto)":
+                    st.session_state.cat_overrides[mc] = {"primary": new_prim, "additional": ""}
                 elif mc in st.session_state.cat_overrides:
                     del st.session_state.cat_overrides[mc]
 
