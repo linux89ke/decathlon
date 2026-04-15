@@ -1450,7 +1450,7 @@ if queries:
                         sel_idx = 0
 
                     col1, col2, col3 = st.columns([2, 2, 3])
-                    col1.markdown(f"**{sku}**  \n`{name}`")
+                    col1.markdown(f"**{sku}** \n`{name}`")
                     col2.markdown(f"Master: `{raw_s}`  \nAuto: `{row['_variation']}`")
                     chosen = col3.selectbox(
                         f"Size for {sku}",
