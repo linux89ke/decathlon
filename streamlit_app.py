@@ -220,6 +220,19 @@ def _normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+MASTER_PICKLE_PATH = "master_data.pkl"
+
+
+def _master_mtime() -> float:
+    """Return modification time of the bundled master file, or 0 if missing."""
+    for path in [MASTER_PATH, MASTER_PATH.replace(".xlsx", ".csv")]:
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            continue
+    return 0.0
+
+
 @st.cache_data(show_spinner="Loading master product data…")
 def load_master(file_bytes: bytes, is_csv: bool) -> pd.DataFrame:
     if is_csv:
@@ -232,6 +245,49 @@ def load_master(file_bytes: bytes, is_csv: bool) -> pd.DataFrame:
     return _normalise_columns(df)
 
 
+def load_master_fast(is_uploaded: bool = False) -> pd.DataFrame:
+    """
+    Load the bundled master file using a pickle cache for speed.
+    Falls back to reading the xlsx/csv directly if pickle is missing or stale.
+    Only used for the bundled file — uploaded overrides always bypass this.
+    """
+    import pickle
+
+    mtime = _master_mtime()
+
+    # Try pickle first
+    if os.path.exists(MASTER_PICKLE_PATH):
+        try:
+            with open(MASTER_PICKLE_PATH, "rb") as f:
+                cached = pickle.load(f)
+            if cached.get("mtime") == mtime:
+                return cached["df"]
+        except Exception:
+            pass  # corrupt pickle — rebuild below
+
+    # Read from xlsx / csv
+    df = None
+    for path, csv in [(MASTER_PATH, False), (MASTER_PATH.replace(".xlsx", ".csv"), True)]:
+        try:
+            raw = open(path, "rb").read()
+            df  = load_master(raw, csv)
+            break
+        except FileNotFoundError:
+            continue
+
+    if df is None:
+        return None
+
+    # Save pickle
+    try:
+        with open(MASTER_PICKLE_PATH, "wb") as f:
+            pickle.dump({"mtime": mtime, "df": df}, f)
+    except Exception:
+        pass
+
+    return df
+
+
 # =============================================================================
 # TF-IDF INDEX
 # =============================================================================
@@ -241,10 +297,40 @@ def _path_to_doc(path: str) -> str:
     return " ".join(parts) + " " + " ".join(parts[-3:]) * 2
 
 
-@st.cache_resource(show_spinner="Building category index (first load only)…")
+TFIDF_PICKLE_PATH = "tfidf_index.pkl"
+
+
+def _cat_mtime() -> float:
+    """Return deca_cat.xlsx modification time, or 0 if missing."""
+    try:
+        return os.path.getmtime(DECA_CAT_PATH)
+    except OSError:
+        return 0.0
+
+
+@st.cache_resource(show_spinner="Loading category index…")
 def build_tfidf_index(ref_bytes: bytes):
+    import pickle
     from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import cosine_similarity
+
+    mtime = _cat_mtime()
+
+    # ── Try loading from pickle ────────────────────────────────────────────
+    if os.path.exists(TFIDF_PICKLE_PATH):
+        try:
+            with open(TFIDF_PICKLE_PATH, "rb") as f:
+                cached = pickle.load(f)
+            if cached.get("mtime") == mtime:
+                return (
+                    cached["leaves"],
+                    cached["vectorizer"],
+                    cached["matrix"],
+                    cached["path_to_export"],
+                )
+        except Exception:
+            pass  # corrupt pickle — rebuild below
+
+    # ── Build from scratch ─────────────────────────────────────────────
     df_cat, _ = load_reference_data(ref_bytes)
     all_paths = df_cat["Category Path"].dropna().astype(str).tolist()
     path_set  = set(all_paths)
@@ -254,6 +340,20 @@ def build_tfidf_index(ref_bytes: bytes):
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
     matrix    = vectorizer.fit_transform(docs)
     path_to_export = dict(zip(df_cat["Category Path"], df_cat["export_category"]))
+
+    # ── Save pickle ───────────────────────────────────────────────────
+    try:
+        with open(TFIDF_PICKLE_PATH, "wb") as f:
+            pickle.dump({
+                "mtime":          mtime,
+                "leaves":         leaves,
+                "vectorizer":     vectorizer,
+                "matrix":         matrix,
+                "path_to_export": path_to_export,
+            }, f)
+    except Exception:
+        pass  # pickle save failure is non-fatal
+
     return leaves, vectorizer, matrix, path_to_export
 
 
@@ -818,9 +918,16 @@ with st.sidebar:
 
     st.markdown("---")
     if st.button("🗑️ Clear Cache & Reset", use_container_width=True,
-                 help="Clears all cached data and resets the session. Use before a fresh upload."):
+                 help="Clears all cached data (including pickle index) and resets the session."):
         st.cache_data.clear()
         st.cache_resource.clear()
+        # Delete pickles so both TF-IDF index and master data are rebuilt on next load
+        for pkl in [TFIDF_PICKLE_PATH, MASTER_PICKLE_PATH]:
+            try:
+                if os.path.exists(pkl):
+                    os.remove(pkl)
+            except Exception:
+                pass
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
@@ -916,29 +1023,19 @@ else:
 # LOAD MASTER DATA
 # =============================================================================
 
-master_bytes = None
-is_csv       = True
-
 if uploaded_master:
+    # User has explicitly uploaded a file — read it directly (no pickle)
     master_bytes = uploaded_master.read()
     is_csv       = uploaded_master.name.endswith(".csv")
     df_master    = load_master(master_bytes, is_csv)
     st.sidebar.success(f"{len(df_master):,} product rows loaded")
 else:
-    loaded = False
-    for path, csv in [(MASTER_PATH, False), (MASTER_PATH.replace(".xlsx", ".csv"), True)]:
-        try:
-            master_bytes = open(path, "rb").read()
-            is_csv       = csv
-            df_master    = load_master(master_bytes, csv)
-            st.sidebar.info(f"Bundled master · {len(df_master):,} rows")
-            loaded = True
-            break
-        except FileNotFoundError:
-            continue
-    if not loaded:
+    # Use pickle-backed fast loader for the bundled master file
+    df_master = load_master_fast()
+    if df_master is None:
         st.error(f"Master file not found. Place '{MASTER_PATH}' in the same folder as app.py.")
         st.stop()
+    st.sidebar.info(f"Bundled master · {len(df_master):,} rows")
 
 img_cols_present = [c for c in IMAGE_COLS if c in df_master.columns]
 data_cols        = [c for c in df_master.columns if c not in img_cols_present]
