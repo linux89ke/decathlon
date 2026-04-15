@@ -27,6 +27,14 @@ except ImportError:
     GROQ_AVAILABLE = False
 
 st.set_page_config(page_title="Decathlon Product Lookup", page_icon="", layout="wide")
+
+# Clear caches on every fresh page load (browser refresh) so data is never stale.
+# We detect a fresh load by checking for a run_id in session_state:
+# a new session = no run_id = fresh browser load.
+if "run_id" not in st.session_state:
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state["run_id"] = 1
 st.markdown("""
 <style>
 h1 { color: #0082C3; }
@@ -803,6 +811,15 @@ with st.sidebar:
     uploaded_master = st.file_uploader("Working file (.xlsx or .csv)", type=["xlsx", "csv"])
 
     st.markdown("---")
+    if st.button("🗑️ Clear Cache & Reset", use_container_width=True,
+                 help="Clears all cached data and resets the session. Use before a fresh upload."):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+    st.markdown("---")
     st.header("Category Matching")
     use_ai_matching = st.toggle(
         "AI matching (Groq)",
@@ -937,7 +954,7 @@ def search(q: str) -> pd.DataFrame:
 # INPUT TABS
 # =============================================================================
 
-tab1, tab2 = st.tabs(["Upload a List", "Manual Entry"])
+tab1, tab2, tab3 = st.tabs(["Upload a List", "Manual Entry", "🗂️ Explore Categories"])
 queries = []
 
 with tab1:
@@ -966,6 +983,63 @@ with tab2:
     )
     if manual.strip():
         queries = [q.strip() for q in manual.strip().splitlines() if q.strip()]
+
+with tab3:
+    st.subheader("🗂️ Category Explorer")
+    if df_cat is None:
+        st.warning("deca_cat.xlsx not loaded — categories unavailable.")
+    else:
+        # Search bar
+        cat_explore_search = st.text_input(
+            "Search categories",
+            placeholder="e.g. running, football, kids, hiking…",
+            key="cat_explore_search",
+        )
+
+        # Build a clean display dataframe
+        cat_display = df_cat[["Category Path", "export_category", "category_name"]].copy()
+        cat_display.columns = ["Full Path", "Export Code", "Category Name"]
+        cat_display = cat_display.drop_duplicates(subset=["Export Code"]).reset_index(drop=True)
+
+        if cat_explore_search.strip():
+            q_lower = cat_explore_search.strip().lower()
+            mask = (
+                cat_display["Full Path"].str.lower().str.contains(q_lower, na=False) |
+                cat_display["Category Name"].str.lower().str.contains(q_lower, na=False) |
+                cat_display["Export Code"].str.lower().str.contains(q_lower, na=False)
+            )
+            cat_display = cat_display[mask].reset_index(drop=True)
+
+        st.caption(f"Showing **{len(cat_display)}** categor{'y' if len(cat_display)==1 else 'ies'}"
+                   + (f" matching '{cat_explore_search}'" if cat_explore_search.strip() else " (all)"))
+
+        # Split path into breadcrumb columns for easier reading
+        path_parts = cat_display["Full Path"].str.split("/", expand=True)
+        path_parts.columns = [f"L{i+1}" for i in range(path_parts.shape[1])]
+
+        display_df = pd.concat([path_parts, cat_display[["Export Code"]]], axis=1)
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            height=500,
+            column_config={
+                col: st.column_config.TextColumn(col, width="medium")
+                for col in display_df.columns
+            },
+        )
+
+        # Download full category list
+        cat_out = io.BytesIO()
+        with pd.ExcelWriter(cat_out, engine="openpyxl") as w:
+            cat_display.to_excel(w, index=False, sheet_name="Categories")
+        st.download_button(
+            "⬇️ Download full category list (.xlsx)",
+            data=cat_out.getvalue(),
+            file_name="decathlon_categories.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 # =============================================================================
