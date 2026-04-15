@@ -6,3 +6,4 @@ Pillow
 openpyxl
 scikit-learn
 groq
+openai
