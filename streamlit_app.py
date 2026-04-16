@@ -373,7 +373,10 @@ def tfidf_shortlist(queries: list, leaves, vectorizer, matrix, k: int = 30) -> l
     out = []
     for row in sims:
         top_idx = np.argsort(row)[::-1][:k]
-        out.append([leaves[i] for i in top_idx if row[i] > 0])
+        # Always return top-k regardless of score so AI always has candidates.
+        # Previously `if row[i] > 0` caused empty lists when query had no
+        # token overlap with any category, giving the model nothing to pick from.
+        out.append([leaves[i] for i in top_idx])
     return out
 
 
