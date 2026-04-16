@@ -642,9 +642,19 @@ def groq_batch(items, api_key, model, concurrency, task_type="cat"):
 
 def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
                          api_key, model, shortlist_k=30, concurrency=10):
+    # Build reverse lookup: export_code -> Category Path (for cases where AI returns codes)
+    export_to_path_rev = {v: k for k, v in path_to_export.items()}
+
     def _resolve(cat_path: str) -> str:
+        if not cat_path:
+            return ""
+        # Direct path → export code lookup
         if cat_path in path_to_export:
             return path_to_export[cat_path]
+        # AI returned an export code directly — it's already resolved
+        if cat_path in export_to_path_rev:
+            return cat_path
+        # Fuzzy path suffix/prefix fallback
         for p, ex in path_to_export.items():
             if p.endswith(cat_path) or cat_path.endswith(p):
                 return ex
@@ -685,7 +695,7 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
             secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
             results.append((primary, secondary))
 
-    return results, model_to_cats
+    return results, model_to_cats, raw_preds
 
 
 def _build_desc_query_per_model(group_df: pd.DataFrame) -> str:
@@ -721,9 +731,20 @@ def ai_short_descriptions(rows_df, api_key, model, concurrency=10):
             fallback_row = rows_df.iloc[model_repr[mc]]
             model_to_desc[mc] = rule_based_short_desc(fallback_row)
         else:
-            bullets = data.get("bullets", [])
-            items_  = "".join(f"<li>{b}</li>" for b in bullets[:3])
-            model_to_desc[mc] = f"<ul>{items_}</ul>"
+            # Gemini sometimes returns "bullet_points" or "items" instead of "bullets"
+            bullets = (
+                data.get("bullets")
+                or data.get("bullet_points")
+                or data.get("items")
+                or []
+            )
+            if bullets:
+                items_  = "".join(f"<li>{b}</li>" for b in bullets[:3])
+                model_to_desc[mc] = f"<ul>{items_}</ul>"
+            else:
+                # No recognisable bullets key — fall back to rule-based and warn
+                fallback_row = rows_df.iloc[model_repr[mc]]
+                model_to_desc[mc] = rule_based_short_desc(fallback_row)
 
     descs = []
     for _, row in rows_df.iterrows():
@@ -1351,17 +1372,19 @@ if queries:
             est             = max(2, unique_models_n // concurrency + 2)
             with st.spinner(f"AI category matching {unique_models_n} unique models (~{est}s)…"):
                 try:
-                    ai_categories, _model_cats = ai_match_categories(
+                    ai_categories, _model_cats, raw_preds = ai_match_categories(
                         combined, leaves, vectorizer, tfidf_matrix, path_to_export,
                         groq_api_key, groq_model, shortlist_k, concurrency,
                     )
                     # Show any per-item errors from the API for debugging
-                    errors = [d for d in ai_categories if isinstance(d, dict) and "error" in d]
+                    errors = [d for d in raw_preds if isinstance(d, dict) and "error" in d]
                     empties = [(i, p) for i, (p, _) in enumerate(ai_categories) if not p]
                     if errors:
                         st.warning(f"AI errors on {len(errors)} item(s): {errors[0]}")
                     if empties:
                         st.warning(f"{len(empties)} item(s) returned empty category — check API response")
+                        with st.expander("🔍 Debug: raw AI category response (first item)"):
+                            st.json(raw_preds[0] if raw_preds else {})
                     st.success(f"AI matched {unique_models_n} models → {n} SKUs")
                 except Exception as e:
                     st.error(f"AI Gateway category error: {e}")
@@ -1377,7 +1400,13 @@ if queries:
             with st.spinner(f"Generating AI short descriptions ({len(combined)} products)…"):
                 try:
                     short_descs = ai_short_descriptions(combined, groq_api_key, groq_model, concurrency)
-                    st.success("Short descriptions generated")
+                    # Count how many fell back to rule-based (contain the rule-based pattern)
+                    ai_generated = sum(1 for d in short_descs if d and "<li>" in d)
+                    fallbacks    = len(short_descs) - ai_generated
+                    if fallbacks > 0:
+                        st.warning(f"Short descriptions: {ai_generated} AI-generated, {fallbacks} fell back to rule-based (check API/JSON response)")
+                    else:
+                        st.success("Short descriptions generated")
                 except Exception as e:
                     st.error(f"Short desc error: {e}")
                     short_descs = None
