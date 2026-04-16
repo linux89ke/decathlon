@@ -589,33 +589,39 @@ def rule_based_short_desc(row: pd.Series) -> str:
 # AI MATCHING
 # =============================================================================
 
-async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_type="cat"):
+async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_type="cat", max_retries=3):
     async with sem:
-        try:
-            if task_type == "cat":
-                cand_list = "\n".join(f"- {c}" for c in candidates)
-                sys_msg   = GROQ_SYSTEM_CAT.format(top_n=top_n)
-                user_msg  = f"Product: {query}\n\nCandidates:\n{cand_list}"
-            else:
-                sys_msg   = GROQ_SYSTEM_DESC
-                user_msg  = f"Product details: {query}"
-            resp = await client.chat.completions.create(
-                model=model,
-                temperature=0.15,
-                # response_format omitted — not supported by all gateway models (e.g. Gemini)
-                messages=[
-                    {"role": "system", "content": sys_msg},
-                    {"role": "user",   "content": user_msg},
-                ],
-            )
-            raw = resp.choices[0].message.content.strip()
-            # Strip markdown code fences Gemini sometimes wraps around JSON
-            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-            raw = re.sub(r"\s*```$", "", raw).strip()
-            data = json.loads(raw)
-            return idx, data
-        except Exception as e:
-            return idx, {"error": str(e)}
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                if task_type == "cat":
+                    cand_list = "\n".join(f"- {c}" for c in candidates)
+                    sys_msg   = GROQ_SYSTEM_CAT.format(top_n=top_n)
+                    user_msg  = f"Product: {query}\n\nCandidates:\n{cand_list}"
+                else:
+                    sys_msg   = GROQ_SYSTEM_DESC
+                    user_msg  = f"Product details: {query}"
+                resp = await client.chat.completions.create(
+                    model=model,
+                    temperature=0.15,
+                    # response_format omitted — not supported by all gateway models (e.g. Gemini)
+                    messages=[
+                        {"role": "system", "content": sys_msg},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                )
+                raw = resp.choices[0].message.content.strip()
+                # Strip markdown code fences Gemini sometimes wraps around JSON
+                raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+                raw = re.sub(r"\s*```$", "", raw).strip()
+                data = json.loads(raw)
+                return idx, data
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s backoff
+                    await asyncio.sleep(wait)
+        return idx, {"error": last_error}
 
 
 async def _parallel_tasks(items, client, model, sem, task_type):
@@ -634,6 +640,8 @@ def groq_batch(items, api_key, model, concurrency, task_type="cat"):
         client = AsyncOpenAI(
             api_key=api_key,
             base_url=AI_GATEWAY_BASE_URL,
+            timeout=90.0,   # Gemini 2.5 Pro can be slow — give it 90s per request
+            max_retries=0,  # We handle retries ourselves in _async_rerank
         )
         sem = asyncio.Semaphore(concurrency)
         return await _parallel_tasks(items, client, model, sem, task_type)
@@ -675,10 +683,19 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
     raw_preds       = groq_batch(items, api_key, model, concurrency, task_type="cat")
 
     model_to_cats: dict = {}
-    for mc, data in zip(model_order, raw_preds):
-        cats      = data.get("categories", [])
-        primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
-        secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
+    for mc, data, cands in zip(model_order, raw_preds, candidates_list):
+        if "error" in data:
+            # AI timed out or errored — fall back to top TF-IDF candidate
+            primary   = _resolve(cands[0]) if cands else ""
+            secondary = _resolve(cands[1]) if len(cands) > 1 else ""
+        else:
+            cats      = data.get("categories", [])
+            primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
+            secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
+            # If AI gave no usable result, fall back to TF-IDF
+            if not primary and cands:
+                primary   = _resolve(cands[0])
+                secondary = _resolve(cands[1]) if len(cands) > 1 else ""
         model_to_cats[mc] = (primary, secondary)
 
     results = []
@@ -690,9 +707,16 @@ def ai_match_categories(rows_df, leaves, vectorizer, matrix, path_to_export,
             q  = _build_query_string(row)
             c  = tfidf_shortlist([q], leaves, vectorizer, matrix, shortlist_k)[0]
             rd = groq_batch([(q, c)], api_key, model, 1, task_type="cat")[0]
-            cats      = rd.get("categories", [])
-            primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
-            secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
+            if "error" in rd:
+                primary   = _resolve(c[0]) if c else ""
+                secondary = _resolve(c[1]) if len(c) > 1 else ""
+            else:
+                cats      = rd.get("categories", [])
+                primary   = _resolve(cats[0]["category"]) if len(cats) > 0 else ""
+                secondary = _resolve(cats[1]["category"]) if len(cats) > 1 else ""
+                if not primary and c:
+                    primary   = _resolve(c[0])
+                    secondary = _resolve(c[1]) if len(c) > 1 else ""
             results.append((primary, secondary))
 
     return results, model_to_cats, raw_preds
@@ -1063,7 +1087,8 @@ with st.sidebar:
                 index=0,
             )
             shortlist_k  = st.slider("Shortlist size", 10, 50, 30)
-            concurrency  = st.slider("Parallel AI requests", 1, 30, 10)
+            concurrency  = st.slider("Parallel AI requests", 1, 10, 3,
+                                     help="Gemini 2.5 Pro is slow — keep this low (2-3) to avoid timeouts.")
             st.markdown("---")
             ai_short_desc = st.toggle("AI short descriptions (Gateway)", value=True)
     else:
@@ -1385,6 +1410,8 @@ if queries:
                         st.warning(f"{len(empties)} item(s) returned empty category — check API response")
                         with st.expander("🔍 Debug: raw AI category response (first item)"):
                             st.json(raw_preds[0] if raw_preds else {})
+                    elif errors:
+                        st.info(f"⚠️ {len(errors)} model(s) timed out — fell back to TF-IDF keyword category")
                     st.success(f"AI matched {unique_models_n} models → {n} SKUs")
                 except Exception as e:
                     st.error(f"AI Gateway category error: {e}")
