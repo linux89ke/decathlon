@@ -599,13 +599,16 @@ async def _async_rerank(idx, query, candidates, client, model, top_n, sem, task_
             resp = await client.chat.completions.create(
                 model=model,
                 temperature=0.15,
-                response_format={"type": "json_object"},
+                # response_format omitted — not supported by all gateway models (e.g. Gemini)
                 messages=[
                     {"role": "system", "content": sys_msg},
                     {"role": "user",   "content": user_msg},
                 ],
             )
-            raw  = resp.choices[0].message.content.strip()
+            raw = resp.choices[0].message.content.strip()
+            # Strip markdown code fences Gemini sometimes wraps around JSON
+            raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"\s*```$", "", raw).strip()
             data = json.loads(raw)
             return idx, data
         except Exception as e:
@@ -1349,6 +1352,13 @@ if queries:
                         combined, leaves, vectorizer, tfidf_matrix, path_to_export,
                         groq_api_key, groq_model, shortlist_k, concurrency,
                     )
+                    # Show any per-item errors from the API for debugging
+                    errors = [d for d in ai_categories if isinstance(d, dict) and "error" in d]
+                    empties = [(i, p) for i, (p, _) in enumerate(ai_categories) if not p]
+                    if errors:
+                        st.warning(f"AI errors on {len(errors)} item(s): {errors[0]}")
+                    if empties:
+                        st.warning(f"{len(empties)} item(s) returned empty category — check API response")
                     st.success(f"AI matched {unique_models_n} models → {n} SKUs")
                 except Exception as e:
                     st.error(f"AI Gateway category error: {e}")
